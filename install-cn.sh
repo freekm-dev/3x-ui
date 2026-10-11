@@ -3,9 +3,8 @@
 # ============================================================
 #   3x-ui 中文一键安装脚本 (install-cn.sh)
 #   镜像仓库: https://github.com/freekm-dev/3x-ui
-#   项目主页: https://freekm.com
 #
-#   基于官方 3x-ui v3.9.0，全程中文交互，资源自托管，
+#   基于官方 3x-ui，全程中文交互，资源自托管，
 #   不依赖官方 mhsanaei 仓库。
 # ============================================================
 
@@ -43,6 +42,64 @@ echo_yellow() { echo -e "${yellow}$*${plain}"; }
 echo_blue()   { echo -e "${blue}$*${plain}"; }
 echo_cyan()   { echo -e "${cyan}$*${plain}"; }
 
+# ---------- 旋转进度指示器（真动画）----------
+# 用法： spin_start "提示文字"  →  spin_stop "成功文字" | spin_fail "失败文字"
+SPIN_PID=""
+_SPIN_MSG=""
+_spin_loop() {
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0
+    while :; do
+        printf "\r${cyan}  %s${plain} %s" "${frames[$i]}" "$_SPIN_MSG"
+        i=$(( (i + 1) % ${#frames[@]} ))
+        sleep 0.08
+    done
+}
+
+# 启动旋转动画（需要传入一段要执行的命令）
+spin_run() {
+    local msg="$1"; shift
+    local ok_msg="$1"; shift
+    local fail_msg="$1"; shift
+    _SPIN_MSG="$msg"
+    if [[ -t 1 ]]; then
+        _spin_loop &
+        SPIN_PID=$!
+        "$@" >/dev/null 2>&1
+        local rc=$?
+        kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null
+        printf "\r\033[K"
+        if [[ $rc -eq 0 ]]; then
+            echo -e "${green}  ✔ ${ok_msg}${plain}"
+        else
+            echo -e "${red}  ✘ ${fail_msg}${plain}"
+        fi
+        return $rc
+    else
+        # 非交互环境：直接执行，输出常规提示
+        "$@" >/dev/null 2>&1
+        local rc=$?
+        if [[ $rc -eq 0 ]]; then echo -e "${green}  ✔ ${ok_msg}${plain}"; else echo -e "${red}  ✘ ${fail_msg}${plain}"; fi
+        return $rc
+    fi
+}
+
+# ---------- 带百分比的下载（真进度）----------
+# 用法： download_file <url> <输出文件> <描述>
+download_file() {
+    local url="$1" out="$2" desc="${3:-下载文件}"
+    local size_hint=""
+    echo -e "${blue}  ↓ ${desc}${plain}"
+    if command -v curl >/dev/null 2>&1; then
+        # --progress-bar 会画出真实进度条；若不可用则退回静默
+        curl -fLR --retry 3 --retry-delay 2 --connect-timeout 20 \
+            --progress-bar -o "${out}" "${url}" || return 1
+    else
+        wget -q --show-progress -O "${out}" "${url}" || return 1
+    fi
+    return 0
+}
+
 print_logo() {
     echo -e "${cyan}"
     cat <<'LOGO'
@@ -55,22 +112,9 @@ print_logo() {
 LOGO
     echo -e "${plain}"
     echo -e "${green}        FreeKm  3x-ui 中文一键安装脚本${plain}"
-    echo -e "${blue}        项目主页: https://freekm.com${plain}"
     echo -e "${blue}        镜像仓库: https://github.com/${mirror_repo}${plain}"
     echo -e "${cyan}        ==========================================${plain}"
     echo ""
-}
-
-# 带进度的下载
-download_with_progress() {
-    local url="$1" out="$2"
-    echo_blue "  下载地址: ${url}"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fLR --retry 3 --retry-delay 2 --connect-timeout 20 \
-            --progress-bar -o "${out}" "${url}"
-    else
-        wget -q --show-progress -O "${out}" "${url}"
-    fi
 }
 
 # ---------- 基础检查 ----------
@@ -125,40 +169,69 @@ is_port_in_use() {
     fi
 }
 
-# ---------- 依赖安装 ----------
+# ---------- 依赖安装（带实时进度 + 快速跳过）----------
+# 检查依赖是否齐全；齐全则直接跳过，避免多余的 apt-get update（通常 5~10 秒）
+deps_all_present() {
+    local c
+    for c in curl tar socat openssl; do
+        command -v "$c" >/dev/null 2>&1 || return 1
+    done
+    [[ -f /usr/share/zoneinfo/UTC || -d /usr/share/zoneinfo ]] || return 1
+    [[ -f /etc/ssl/certs/ca-certificates.crt || -d /etc/ssl/certs ]] || return 1
+    command -v crontab >/dev/null 2>&1 || command -v cron >/dev/null 2>&1 || \
+        systemctl list-unit-files 2>/dev/null | grep -qE '^(cron|cronie|crond)\.service' || return 1
+    return 0
+}
+
 install_base_deps() {
-    echo_blue "正在安装基础依赖（curl/tar/openssl 等）..."
+    echo ""
+    echo_cyan "[1/6] 检查并安装基础依赖"
+
+    if deps_all_present; then
+        echo_green "  ✔ 基础依赖已齐全，跳过安装（节省时间）"
+        return 0
+    fi
+
     local pkgs="curl tar tzdata socat ca-certificates openssl cron"
+
     case "${release}" in
         ubuntu | debian | armbian)
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -q >/dev/null 2>&1
-            apt-get install -y -q $pkgs >/dev/null 2>&1
+            spin_run "更新软件源索引..." "软件源索引已更新" "软件源更新失败（继续尝试）" \
+                apt-get update -q
+            spin_run "安装依赖 (curl tar openssl 等)..." "基础依赖安装完成" "部分依赖安装失败" \
+                apt-get install -y -q $pkgs
             ;;
         centos | almalinux | rocky | rhel | fedora | amzn | ol)
             if command -v dnf >/dev/null 2>&1; then
-                dnf makecache -y >/dev/null 2>&1; dnf install -y -q $pkgs >/dev/null 2>&1
+                spin_run "更新 dnf 缓存..." "dnf 缓存已更新" "dnf 缓存更新失败" dnf makecache -y
+                spin_run "安装依赖..." "基础依赖安装完成" "部分依赖安装失败" dnf install -y -q cronie curl tar tzdata socat ca-certificates openssl
             else
-                yum makecache -y >/dev/null 2>&1; yum install -y -q $pkgs >/dev/null 2>&1
+                spin_run "更新 yum 缓存..." "yum 缓存已更新" "yum 缓存更新失败" yum makecache -y
+                spin_run "安装依赖..." "基础依赖安装完成" "部分依赖安装失败" yum install -y -q cronie curl tar tzdata socat ca-certificates openssl
             fi
             ;;
         arch | manjaro | parch)
-            pacman -Sy --noconfirm $pkgs >/dev/null 2>&1
+            spin_run "安装依赖..." "基础依赖安装完成" "部分依赖安装失败" pacman -Sy --noconfirm $pkgs
             ;;
         alpine)
-            apk update >/dev/null 2>&1
-            apk add curl tar tzdata socat ca-certificates openssl dcron >/dev/null 2>&1
+            spin_run "更新 apk 索引..." "apk 索引已更新" "apk 更新失败" apk update
+            spin_run "安装依赖..." "基础依赖安装完成" "部分依赖安装失败" apk add curl tar tzdata socat ca-certificates openssl dcron
             ;;
         opensuse* | sles)
-            zypper refresh >/dev/null 2>&1
-            zypper -q install -y curl tar timezone socat ca-certificates openssl cron >/dev/null 2>&1
+            spin_run "刷新 zypper 源..." "zypper 源已刷新" "zypper 刷新失败" zypper refresh
+            spin_run "安装依赖..." "基础依赖安装完成" "部分依赖安装失败" zypper -q install -y curl tar timezone socat ca-certificates openssl cron
             ;;
         *)
-            command -v apt-get >/dev/null 2>&1 && apt-get install -y -q $pkgs >/dev/null 2>&1
-            command -v yum >/dev/null 2>&1 && yum install -y -q $pkgs >/dev/null 2>&1
+            if command -v apt-get >/dev/null 2>&1; then
+                spin_run "安装依赖..." "基础依赖安装完成" "部分依赖安装失败" apt-get install -y -q $pkgs
+            elif command -v yum >/dev/null 2>&1; then
+                spin_run "安装依赖..." "基础依赖安装完成" "部分依赖安装失败" yum install -y -q $pkgs
+            else
+                echo_yellow "  未识别的包管理器，跳过依赖安装。"
+            fi
             ;;
     esac
-    echo_green "基础依赖安装完成。"
 }
 
 # ---------- 防火墙放行（可放行多个端口） ----------
@@ -173,7 +246,6 @@ open_firewall_ports() {
     done
     [[ -z "$port_list" ]] && return 0
 
-    echo_blue "正在放行防火墙端口:${port_list} ..."
     local done=0
 
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
@@ -192,10 +264,10 @@ open_firewall_ports() {
     fi
 
     if [[ $done -eq 0 ]]; then
-        echo_yellow "未检测到已启用的 ufw / firewalld。"
-        echo_yellow "如果你的服务商有安全组，请手动放行:${port_list}"
+        echo_yellow "  ! 未检测到已启用的 ufw / firewalld。"
+        echo_yellow "    如服务商有安全组，请手动放行:${port_list}"
     else
-        echo_green "防火墙已放行:${port_list}"
+        echo_green "  ✔ 防火墙已放行:${port_list}"
     fi
 }
 
@@ -203,7 +275,6 @@ open_firewall_ports() {
 close_firewall_port() {
     local port="$1"
     [[ -z "$port" ]] && return 0
-    echo_blue "正在关闭防火墙对外端口 TCP ${port}（仅保留本地访问）..."
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
         ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
     fi
@@ -211,7 +282,6 @@ close_firewall_port() {
         firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
-    echo_green "已处理端口 ${port}。"
 }
 
 # ---------- 下载并解压安装包 ----------
@@ -227,51 +297,51 @@ download_and_install() {
     cd "${tmp_dir}" || exit 1
 
     echo ""
-    echo_cyan "[1/5] 下载安装包"
-    download_with_progress "${url}" "${tarball}"
+    echo_cyan "[3/6] 下载安装包"
+    download_file "${url}" "${tarball}" "正在下载 3x-ui 安装包（约 80MB，请耐心等待）"
     if [[ ! -s "${tarball}" ]]; then
         echo_red "下载失败或文件为空，请检查网络后重试。"
         cd / && rm -rf "${tmp_dir}"; exit 1
     fi
-    echo_green "  ✓ 下载完成 ($(du -h "${tarball}" | cut -f1))"
+    echo_green "  ✔ 下载完成 ($(du -h "${tarball}" | cut -f1))"
 
     echo ""
-    echo_cyan "[2/5] 校验安装包完整性"
+    echo_cyan "[4/6] 校验安装包完整性"
     if curl -fsLR --retry 2 --connect-timeout 15 -o "${tarball}.sha256" "${sha_url}" 2>/dev/null; then
         local expected actual
         expected=$(awk 'NR==1{print $1}' "${tarball}.sha256")
         actual=$(sha256sum "${tarball}" | awk '{print $1}')
         if [[ "${expected}" == "${actual}" && -n "${actual}" ]]; then
-            echo_green "  ✓ 完整性校验通过"
+            echo_green "  ✔ SHA256 完整性校验通过"
         else
-            echo_red "  ✗ 校验失败，安装包可能被篡改，已中止。"
+            echo_red "  ✘ 校验失败，安装包可能被篡改，已中止。"
             cd / && rm -rf "${tmp_dir}"; exit 1
         fi
     else
-        echo_yellow "  - 未获取到校验文件，跳过校验"
+        echo_yellow "  ! 未获取到校验文件，跳过校验"
     fi
 
-    echo ""
-    echo_cyan "[3/5] 解压安装包"
-    tar -xzf "${tarball}" || { echo_red "解压失败。"; cd / && rm -rf "${tmp_dir}"; exit 1; }
-    echo_green "  ✓ 解压完成"
+    spin_run "解压安装包..." "解压完成" "解压失败" tar -xzf "${tarball}"
+    if [[ ! -d x-ui ]]; then
+        echo_red "安装包结构异常。"
+        cd / && rm -rf "${tmp_dir}"; exit 1
+    fi
 
     if systemctl is-active --quiet "${xui_service_name}" 2>/dev/null; then
-        echo_yellow "  检测到旧面板，正在停止..."
-        systemctl stop "${xui_service_name}" >/dev/null 2>&1
+        spin_run "停止旧面板服务..." "旧面板已停止" "旧面板停止失败" systemctl stop "${xui_service_name}"
     fi
 
     cd x-ui || { echo_red "安装包结构异常。"; cd / && rm -rf "${tmp_dir}"; exit 1; }
     chmod +x x-ui bin/xray-linux-* 2>/dev/null || true
 
     echo ""
-    echo_cyan "[4/5] 安装程序文件"
+    echo_cyan "[5/6] 安装程序文件"
     mkdir -p "${xui_folder}"
     cp -f x-ui "${xui_folder}/x-ui"
     cp -rf bin "${xui_folder}/"
     [[ -f x-ui.sh ]] && cp -f x-ui.sh "${xui_folder}/x-ui.sh"
     chmod +x "${xui_folder}/x-ui" "${xui_folder}/x-ui.sh" 2>/dev/null || true
-    echo_green "  ✓ 程序文件已安装到 ${xui_folder}"
+    echo_green "  ✔ 程序文件已安装到 ${xui_folder}"
 
     # service 文件
     local svc_src=""
@@ -286,21 +356,20 @@ download_and_install() {
         curl -fsLR -o "${xui_service_folder}/${xui_service_name}.service" \
             "${raw_base}/x-ui.service.debian" >/dev/null 2>&1 || true
     fi
-    echo_green "  ✓ 服务文件已配置"
+    echo_green "  ✔ 服务文件已配置"
 
-    # ★ 关键修复：注册 x-ui 命令到 /usr/bin
+    # 注册 x-ui 命令到 /usr/bin
     echo ""
-    echo_cyan "[5/5] 注册 x-ui 管理命令"
+    echo_cyan "[6/6] 注册 x-ui 管理命令"
     if [[ -f "${xui_folder}/x-ui.sh" ]]; then
         cp -f "${xui_folder}/x-ui.sh" /usr/bin/x-ui
         chmod +x /usr/bin/x-ui
-        echo_green "  ✓ 已注册命令: x-ui"
-        # 汉化管理菜单
-        localize_menu /usr/bin/x-ui
+        mkdir -p /var/log/x-ui
+        spin_run "汉化管理菜单..." "管理菜单已汉化" "菜单汉化跳过" localize_menu /usr/bin/x-ui
+        echo_green "  ✔ 已注册命令: x-ui"
     else
-        echo_yellow "  - 未找到 x-ui.sh，命令注册跳过"
+        echo_yellow "  ! 未找到 x-ui.sh，命令注册跳过"
     fi
-    mkdir -p /var/log/x-ui
 
     cd / && rm -rf "${tmp_dir}"
 }
@@ -309,9 +378,8 @@ download_and_install() {
 localize_menu() {
     local target="$1"
     [[ ! -f "${target}" ]] && return 0
-    # 用 python3 做精确替换（若可用），否则用 sed 兜底
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "${target}" <<'PYEOF'
+        python3 - "${target}" <<'PYEOF' >/dev/null 2>&1 || true
 import sys
 path = sys.argv[1]
 REPL = [
@@ -350,12 +418,33 @@ REPL = [
     ("Please choose an option", "请选择操作"),
     ("Panel state:", "面板状态:"),
     ("Xray state:", "Xray 状态:"),
+    ("xray state:", "Xray 状态:"),
+    ("启动 automatically:", "开机自启:"),
+    ("automatically:", "开机自启:"),
+    ("开机自启: Yes", "开机自启: 是"),
+    ("开机自启: No", "开机自启: 否"),
     ("MTProto state:", "MTProto 状态:"),
     ("Running", "运行中"),
     ("Not Running", "未运行"),
     ("Not Installed", "未安装"),
     ("Please enter your selection", "请输入选项"),
     ("The OS release is:", "当前系统:"),
+    ("Failed to start", "启动失败"),
+    ("Failed to", "操作失败："),
+    ("Successfully", "操作成功"),
+    ("Are you sure", "你确定要"),
+    ("y/n", "y/n"),
+    ("Please enter", "请输入"),
+    ("Invalid", "无效输入"),
+    ("Cancelled", "已取消"),
+    ("Done", "完成"),
+    ("Exiting", "正在退出"),
+    ("Press Enter to continue", "按回车键继续"),
+    ("Enable", "开启"),
+    ("Disable", "关闭"),
+    ("Local time", "本机时间"),
+    ("System time", "系统时间"),
+    ("Version", "版本"),
 ]
 with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
     c = f.read()
@@ -364,10 +453,9 @@ for en, zh in REPL:
 with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
     f.write(c)
 PYEOF
-        echo_green "  ✓ 管理菜单已汉化"
-    else
-        echo_yellow "  - 系统无 python3，管理菜单保留英文"
+        return 0
     fi
+    return 0
 }
 
 # ---------- 获取最新版本 ----------
@@ -388,8 +476,8 @@ ask_database() {
     echo_cyan "======================================================"
     echo_cyan "  请选择数据库类型"
     echo_cyan "======================================================"
-    echo -e "${green}  1) SQLite${plain}      —— 单文件数据库，本机自带，零配置"
-    echo -e "${green}  2) PostgreSQL${plain}  —— 独立数据库服务，适合大量客户端"
+    echo -e "${green}  1  SQLite${plain}      —— 单文件数据库，本机自带，零配置"
+    echo -e "${green}  2  PostgreSQL${plain}  —— 独立数据库服务，适合大量客户端"
     echo ""
     echo_yellow "  简单说："
     echo -e "${blue}    · 就你自己一个人用 / 客户端没几个  → 选 ${green}1${plain}"
@@ -397,6 +485,7 @@ ask_database() {
     echo ""
     local choice
     read -rp "  请输入选项（直接回车默认选 1）: " choice
+    choice="${choice// /}"
     case "$choice" in
         2) CHOICE_DB="postgres" ;;
         *) CHOICE_DB="sqlite" ;;
@@ -414,10 +503,10 @@ ask_ssl() {
     echo_cyan "======================================================"
     echo_cyan "  请选择 SSL 证书方式（给面板加锁，防止被窃听）"
     echo_cyan "======================================================"
-    echo -e "${green}  1) 域名证书${plain}   —— 需要你有域名，证书 90 天有效，自动续期"
-    echo -e "${green}  2) IP 证书${plain}     —— 用服务器 IP 申请，证书约 6 天有效，自动续期"
-    echo -e "${green}  3) 自有证书${plain}     —— 你已有证书文件，填路径即可"
-    echo -e "${green}  4) 不加证书（跳过）${plain} —— 面板走 HTTP，仅适合靠 SSH 隧道访问"
+    echo -e "${green}  1  域名证书${plain}   —— 需要你有域名，证书 90 天有效，自动续期"
+    echo -e "${green}  2  IP 证书${plain}     —— 用服务器 IP 申请，证书约 6 天有效，自动续期"
+    echo -e "${green}  3  自有证书${plain}     —— 你已有证书文件，填路径即可"
+    echo -e "${green}  4  不加证书（跳过）${plain} —— 面板走 HTTP，仅适合靠 SSH 隧道访问"
     echo ""
     echo_yellow "  打个比方："
     echo -e "${blue}    · 有域名、想让别人也能 https 访问      → 选 ${green}1${plain}"
@@ -425,7 +514,7 @@ ask_ssl() {
     echo -e "${blue}    · 已有证书文件                        → 选 ${green}3${plain}"
     echo -e "${blue}    · 只想自己用、习惯走 SSH 隧道最安全    → 选 ${green}4${plain}"
     echo ""
-    echo_yellow "  说明：选 1、2 需要放行 80 端口用于证书签发。"
+    echo_yellow "  说明：选 1 或 2 会自动为你放行 80 端口用于证书签发。"
     local choice
     read -rp "  请输入选项（直接回车默认选 4 跳过）: " choice
     choice="${choice// /}"
@@ -442,10 +531,16 @@ ask_ssl() {
                 echo_yellow "  域名格式不正确，请重新输入。"
             done
             echo_green "  已选择：域名证书（${SSL_DOMAIN}）"
+            # 自动放行 80 端口用于证书签发
+            echo_blue "  域名证书需要 80 端口做验证，正在自动放行 80 端口..."
+            open_firewall_ports 80
             ;;
         2)
             CHOICE_SSL="2"
             echo_green "  已选择：IP 证书"
+            # 自动放行 80 端口用于证书签发
+            echo_blue "  IP 证书需要 80 端口做验证，正在自动放行 80 端口..."
+            open_firewall_ports 80
             ;;
         3)
             CHOICE_SSL="3"
@@ -468,6 +563,36 @@ ask_ssl() {
     esac
 }
 
+# ---------- 交互：安装前确认 ----------
+ask_confirm() {
+    echo ""
+    echo_cyan "======================================================"
+    echo_cyan "  安装前确认"
+    echo_cyan "======================================================"
+    echo -e "${blue}  数据库  : ${plain}${CHOICE_DB}"
+    case "${CHOICE_SSL}" in
+        1) echo -e "${blue}  SSL     : ${plain}域名证书 (${SSL_DOMAIN})" ;;
+        2) echo -e "${blue}  SSL     : ${plain}IP 证书" ;;
+        3) echo -e "${blue}  SSL     : ${plain}自有证书" ;;
+        *) echo -e "${blue}  SSL     : ${plain}不加证书（仅 SSH 隧道访问）" ;;
+    esac
+    echo ""
+    echo_yellow "  以上配置将开始安装 3x-ui 面板，是否继续？"
+    local choice
+    read -rp "  输入 y 确认安装，输入 n 取消（直接回车默认确认）: " choice
+    choice="${choice// /}"
+    case "$choice" in
+        n|N|no|NO)
+            echo_yellow "  已取消安装。"
+            exit 0
+            ;;
+        *)
+            echo_green "  已确认，开始安装..."
+            return 0
+            ;;
+    esac
+}
+
 # ---------- 交互：安全加固 ----------
 ask_security_hardening() {
     echo ""
@@ -482,16 +607,22 @@ ask_security_hardening() {
     read -rp "  是否安装 fail2ban 防暴力破解？[y/N]: " choice
     case "$choice" in
         y|Y|yes|YES)
-            echo_blue "  正在安装 fail2ban..."
             case "${release}" in
-                ubuntu|debian|armbian) apt-get install -y -q fail2ban >/dev/null 2>&1 ;;
+                ubuntu|debian|armbian)
+                    spin_run "正在安装 fail2ban..." "fail2ban 已安装" "fail2ban 安装失败" apt-get install -y -q fail2ban
+                    ;;
                 centos|almalinux|rocky|rhel|fedora|amzn|ol)
-                    command -v dnf >/dev/null 2>&1 && dnf install -y -q fail2ban >/dev/null 2>&1 || yum install -y -q fail2ban >/dev/null 2>&1 ;;
+                    if command -v dnf >/dev/null 2>&1; then
+                        spin_run "正在安装 fail2ban..." "fail2ban 已安装" "fail2ban 安装失败" dnf install -y -q fail2ban
+                    else
+                        spin_run "正在安装 fail2ban..." "fail2ban 已安装" "fail2ban 安装失败" yum install -y -q fail2ban
+                    fi
+                    ;;
                 *) echo_yellow "  未知系统，跳过 fail2ban 安装" ;;
             esac
             systemctl enable fail2ban >/dev/null 2>&1
             systemctl restart fail2ban >/dev/null 2>&1
-            echo_green "  ✓ fail2ban 已安装并启用"
+            echo_green "  ✔ fail2ban 已启用"
             ;;
         *)
             echo_yellow "  - 已跳过 fail2ban。"
@@ -514,28 +645,27 @@ apply_ssl() {
     local port="$1" domain="$2" ip="$3"
     case "${CHOICE_SSL}" in
         1|2)
-            echo_blue "  正在安装 acme.sh 并申请证书..."
-            if ! command -v ~/.acme.sh/acme.sh >/dev/null 2>&1 && [[ ! -f /root/.acme.sh/acme.sh ]]; then
-                curl -s https://get.acme.sh | sh >/dev/null 2>&1 || {
-                    echo_yellow "  acme.sh 安装失败，退回 HTTP 模式。"
-                    CHOICE_SSL="4"; return 1
-                }
-            fi
+            spin_run "安装 acme.sh 证书工具..." "acme.sh 已就绪" "acme.sh 安装失败" \
+                bash -c 'curl -s https://get.acme.sh | sh'
             local ACME="/root/.acme.sh/acme.sh"
             [[ ! -f "$ACME" ]] && ACME="$HOME/.acme.sh/acme.sh"
+            if [[ ! -f "$ACME" ]]; then
+                echo_yellow "  ! 未找到 acme.sh，退回 HTTP 模式。"
+                CHOICE_SSL="4"; return 1
+            fi
             local target="${domain:-$ip}"
             if [[ "${CHOICE_SSL}" == "2" ]]; then
-                echo_yellow "  IP 证书签发需要 80 端口可达，可能耗时较长..."
-                "$ACME" --issue -d "${ip}" --standalone --server letsencrypt --days 6 >/dev/null 2>&1 || {
-                    echo_yellow "  IP 证书签发失败（可能 80 端口不通），退回 HTTP 模式。"
+                echo_blue "  正在申请 IP 证书（需要 80 端口可达，可能耗时较长）..."
+                if ! "$ACME" --issue -d "${ip}" --standalone --server letsencrypt --days 6 >/dev/null 2>&1; then
+                    echo_yellow "  ! IP 证书签发失败（可能 80 端口不通），退回 HTTP 模式。"
                     CHOICE_SSL="4"; return 1
-                }
+                fi
             else
-                echo_yellow "  域名证书签发需要 80 端口可达..."
-                "$ACME" --issue -d "${target}" --standalone >/dev/null 2>&1 || {
-                    echo_yellow "  域名证书签发失败（可能 80 端口不通），退回 HTTP 模式。"
+                echo_blue "  正在申请域名证书（需要 80 端口可达）..."
+                if ! "$ACME" --issue -d "${target}" --standalone >/dev/null 2>&1; then
+                    echo_yellow "  ! 域名证书签发失败（可能 80 端口不通），退回 HTTP 模式。"
                     CHOICE_SSL="4"; return 1
-                }
+                fi
             fi
             local cert_dir="/etc/x-ui/cert"
             mkdir -p "${cert_dir}"
@@ -545,17 +675,17 @@ apply_ssl() {
                 --reloadcmd "systemctl restart x-ui" >/dev/null 2>&1 || true
             if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]]; then
                 "${xui_folder}/x-ui" cert -webCert "${cert_dir}/fullchain.pem" -webCertKey "${cert_dir}/privkey.pem" >/dev/null 2>&1 || true
-                echo_green "  ✓ 证书已申请并配置"
+                echo_green "  ✔ 证书已申请并配置"
                 return 0
             else
-                echo_yellow "  证书文件未生成，退回 HTTP 模式。"
+                echo_yellow "  ! 证书文件未生成，退回 HTTP 模式。"
                 CHOICE_SSL="4"; return 1
             fi
             ;;
         3)
             echo_blue "  正在配置自有证书..."
             "${xui_folder}/x-ui" cert -webCert "${SSL_CERT_PATH}" -webCertKey "${SSL_KEY_PATH}" >/dev/null 2>&1 || true
-            echo_green "  ✓ 自有证书已配置"
+            echo_green "  ✔ 自有证书已配置"
             ;;
         *)
             echo_yellow "  已跳过 SSL，面板使用 HTTP。"
@@ -604,8 +734,11 @@ main() {
     install_base_deps
 
     # 交互选择
+    echo ""
+    echo_cyan "[2/6] 配置选项"
     ask_database
     ask_ssl
+    ask_confirm
 
     # 版本
     local tag="${XUI_VERSION:-}"
@@ -636,10 +769,10 @@ main() {
     apply_panel_settings "${config_port}" "${config_username}" "${config_password}" "${config_webpath}"
 
     # 启动服务
-    systemctl daemon-reload >/dev/null 2>&1
-    systemctl enable "${xui_service_name}" >/dev/null 2>&1
-    systemctl restart "${xui_service_name}" >/dev/null 2>&1
+    spin_run "启动 x-ui 面板服务..." "面板服务已启动" "面板服务启动异常" \
+        bash -c "systemctl daemon-reload && systemctl enable x-ui >/dev/null 2>&1 && systemctl restart x-ui"
     sleep 1
+    systemctl daemon-reload >/dev/null 2>&1
 
     # SSL
     local scheme="http"
@@ -649,7 +782,6 @@ main() {
     # 防火墙：443 始终放行；面板端口按 SSL 选择决定
     local fw_ports=("443")
     if [[ "${CHOICE_SSL}" == "4" ]]; then
-        # 跳过 SSL：面板端口不对公网放行，仅隧道
         close_firewall_port "${config_port}"
     else
         fw_ports+=("${config_port}")
@@ -702,7 +834,6 @@ main() {
     echo -e "${blue}  查看实时日志 : ${plain}journalctl -u x-ui -f"
     echo ""
     echo_cyan "  镜像仓库: https://github.com/${mirror_repo}"
-    echo_cyan "  项目主页: https://freekm.com"
     echo_cyan "======================================================"
 }
 
