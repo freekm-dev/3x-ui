@@ -34,6 +34,7 @@ CHOICE_SSL="4"
 SSL_DOMAIN=""
 SSL_CERT_PATH=""
 SSL_KEY_PATH=""
+NEED_PORT_80=""   # 选 1/2 时置 1，安装完成后统一放行 80
 
 # 运行环境信息（全局）
 MACHINE_ARCH=""
@@ -636,7 +637,7 @@ ask_ssl() {
     echo -e "${blue}    · 已有证书文件                        → 选 ${green}3${plain}"
     echo -e "${blue}    · 只想自己用、习惯走 SSH 隧道最安全    → 选 ${green}4${plain}"
     echo ""
-    echo_yellow "  说明：选 1 或 2 会自动为你放行 80 端口用于证书签发。"
+    echo_yellow "  说明：选 1 或 2 会在安装完成时自动为你放行 80 端口用于证书签发。"
     local choice
     read -rp "  请输入选项（直接回车默认选 4 跳过）: " choice
     choice="${choice// /}"
@@ -653,16 +654,16 @@ ask_ssl() {
                 echo_yellow "  域名格式不正确，请重新输入。"
             done
             echo_green "  已选择：域名证书（${SSL_DOMAIN}）"
-            # 自动放行 80 端口用于证书签发
-            echo_blue "  域名证书需要 80 端口做验证，正在自动放行 80 端口..."
-            open_firewall_ports 80
+            # 80 端口放行延后到安装完成时统一处理（见 main 中防火墙节点）
+            NEED_PORT_80="1"
+            echo_blue "  域名证书需要 80 端口做验证，将在安装完成时自动放行 80 端口。"
             ;;
         2)
             CHOICE_SSL="2"
             echo_green "  已选择：IP 证书"
-            # 自动放行 80 端口用于证书签发
-            echo_blue "  IP 证书需要 80 端口做验证，正在自动放行 80 端口..."
-            open_firewall_ports 80
+            # 80 端口放行延后到安装完成时统一处理
+            NEED_PORT_80="1"
+            echo_blue "  IP 证书需要 80 端口做验证，将在安装完成时自动放行 80 端口。"
             ;;
         3)
             CHOICE_SSL="3"
@@ -1060,15 +1061,29 @@ main() {
     apply_ssl "${config_port}" "${SSL_DOMAIN}" "${SERVER_IP}" && true
     [[ "${CHOICE_SSL}" != "4" ]] && scheme="https"
 
-    # 防火墙策略（443 为保留端口，任何情况下都必须放行）：
-    #   · 443          → 始终放行（供用户后续自配服务使用，面板本身不用 443）
+    # ============================================================
+    # 防火墙策略（仅在用户已确认安装、且面板安装完成后执行）
+    #   · 443          → 永远放行（保留给用户后续自配服务使用，面板本身不用 443）
     #   · 选 1/2/3     → 额外放行面板端口（对公网开放）
     #   · 选 4（隧道） → 不放行面板端口，但 443 仍保持放行
+    #   · 选 1/2       → 额外放行 80 端口（证书签发验证用）
+    # 注：用户若在“输入 y 开始安装”处选择退出，则不会执行到此处，
+    #     防火墙不会有任何改动。
+    # ============================================================
+    echo ""
+    echo_cyan "[防火墙] 根据你的选择配置端口放行..."
+
     if [[ "${CHOICE_SSL}" == "4" ]]; then
+        # 隧道模式：确保面板端口不对公网开放
         close_firewall_port "${config_port}"
         open_firewall_ports 443
     else
         open_firewall_ports 443 "${config_port}"
+    fi
+
+    # 选 1/2 需要 80 端口做证书签发验证
+    if [[ -n "${NEED_PORT_80}" ]]; then
+        open_firewall_ports 80
     fi
 
     # 兜底复查：确保 443 确实处于放行状态
