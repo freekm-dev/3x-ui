@@ -278,9 +278,15 @@ open_firewall_ports() {
 }
 
 # ---------- 防火墙关闭某端口 ----------
+# 注意：443 为保留端口，任何情况下都不允许关闭（用户后续自配服务需要它）
 close_firewall_port() {
     local port="$1"
     [[ -z "$port" ]] && return 0
+    # 硬保护：443 永不关闭
+    if [[ "${port}" == "443" ]]; then
+        echo_yellow "  ! 443 为保留端口，已跳过关闭操作。"
+        return 0
+    fi
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
         ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
     fi
@@ -1054,14 +1060,31 @@ main() {
     apply_ssl "${config_port}" "${SSL_DOMAIN}" "${SERVER_IP}" && true
     [[ "${CHOICE_SSL}" != "4" ]] && scheme="https"
 
-    # 防火墙：443 始终放行；面板端口按 SSL 选择决定
-    local fw_ports=("443")
+    # 防火墙策略（443 为保留端口，任何情况下都必须放行）：
+    #   · 443          → 始终放行（供用户后续自配服务使用，面板本身不用 443）
+    #   · 选 1/2/3     → 额外放行面板端口（对公网开放）
+    #   · 选 4（隧道） → 不放行面板端口，但 443 仍保持放行
     if [[ "${CHOICE_SSL}" == "4" ]]; then
         close_firewall_port "${config_port}"
+        open_firewall_ports 443
     else
-        fw_ports+=("${config_port}")
+        open_firewall_ports 443 "${config_port}"
     fi
-    open_firewall_ports "${fw_ports[@]}"
+
+    # 兜底复查：确保 443 确实处于放行状态
+    if firewall_active; then
+        if ssh_port_is_allowed 443; then
+            echo_green "  ✔ 已确认 443 端口放行（保留给后续自配服务）"
+        else
+            echo_yellow "  ! 443 端口首次放行未生效，正在重试..."
+            open_firewall_ports 443 >/dev/null 2>&1 || true
+            if ssh_port_is_allowed 443; then
+                echo_green "  ✔ 已确认 443 端口放行（保留给后续自配服务）"
+            else
+                echo_red "  ⚠ 443 端口放行失败，请手动执行： ufw allow 443/tcp"
+            fi
+        fi
+    fi
 
     write_install_result "${config_username}" "${config_password}" "${config_port}" "${config_webpath}" "${scheme}" "${server_ip}"
 
