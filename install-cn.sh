@@ -14,6 +14,7 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 blue='\033[0;34m'
 cyan='\033[0;36m'
+magenta='\033[0;35m'
 plain='\033[0m'
 
 # ---------- 镜像与版本配置（集中管理） ----------
@@ -25,9 +26,15 @@ xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
 xui_service_folder="/etc/systemd/system"
 xui_service_name="x-ui"
 
-# 随机凭据长度
 RAND_USER_LEN=10
 RAND_PASS_LEN=12
+
+# 用户选择结果（全局）
+CHOICE_DB="sqlite"
+CHOICE_SSL="4"
+SSL_DOMAIN=""
+SSL_CERT_PATH=""
+SSL_KEY_PATH=""
 
 # ---------- 输出辅助 ----------
 echo_red()    { echo -e "${red}$*${plain}"; }
@@ -42,7 +49,7 @@ print_logo() {
     ______               __ __
    / ____/______  ___  / //_/___ ___  ____ _
   / /_  / ___/ _ \/ _ \/ ,< / __ `__ \/ __ `/
- / __/ / /  /  __/  __/ /| |/ / / / / / /_/ /
+ / __/ / /  /  __/  __/ /| |/ / / / / /_/ /
 /_/   /_/   \___/\___/_/ |_/_/ /_/ /_/\__, /
                                       /____/
 LOGO
@@ -52,6 +59,18 @@ LOGO
     echo -e "${blue}        镜像仓库: https://github.com/${mirror_repo}${plain}"
     echo -e "${cyan}        ==========================================${plain}"
     echo ""
+}
+
+# 带进度的下载
+download_with_progress() {
+    local url="$1" out="$2"
+    echo_blue "  下载地址: ${url}"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fLR --retry 3 --retry-delay 2 --connect-timeout 20 \
+            --progress-bar -o "${out}" "${url}"
+    else
+        wget -q --show-progress -O "${out}" "${url}"
+    fi
 }
 
 # ---------- 基础检查 ----------
@@ -74,7 +93,6 @@ check_os() {
         echo_red "无法检测系统版本，/etc/os-release 不存在。"
         exit 1
     fi
-    release_version="${VERSION_ID:-}"
     echo_green "当前系统：${PRETTY_NAME:-$release}"
 }
 
@@ -109,7 +127,7 @@ is_port_in_use() {
 
 # ---------- 依赖安装 ----------
 install_base_deps() {
-    echo_blue "正在安装基础依赖..."
+    echo_blue "正在安装基础依赖（curl/tar/openssl 等）..."
     local pkgs="curl tar tzdata socat ca-certificates openssl cron"
     case "${release}" in
         ubuntu | debian | armbian)
@@ -119,9 +137,9 @@ install_base_deps() {
             ;;
         centos | almalinux | rocky | rhel | fedora | amzn | ol)
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y -q $pkgs >/dev/null 2>&1 || dnf makecache -y >/dev/null 2>&1 && dnf install -y -q $pkgs >/dev/null 2>&1
+                dnf makecache -y >/dev/null 2>&1; dnf install -y -q $pkgs >/dev/null 2>&1
             else
-                yum install -y -q $pkgs >/dev/null 2>&1 || yum makecache -y >/dev/null 2>&1 && yum install -y -q $pkgs >/dev/null 2>&1
+                yum makecache -y >/dev/null 2>&1; yum install -y -q $pkgs >/dev/null 2>&1
             fi
             ;;
         arch | manjaro | parch)
@@ -136,7 +154,6 @@ install_base_deps() {
             zypper -q install -y curl tar timezone socat ca-certificates openssl cron >/dev/null 2>&1
             ;;
         *)
-            echo_yellow "未知系统（${release}），将尝试使用 apt/yum。"
             command -v apt-get >/dev/null 2>&1 && apt-get install -y -q $pkgs >/dev/null 2>&1
             command -v yum >/dev/null 2>&1 && yum install -y -q $pkgs >/dev/null 2>&1
             ;;
@@ -144,28 +161,57 @@ install_base_deps() {
     echo_green "基础依赖安装完成。"
 }
 
-# ---------- 防火墙放行 ----------
-open_firewall_port() {
-    local port="$1"
-    [[ -z "$port" ]] && return 0
-    echo_blue "正在尝试放行面板端口 TCP ${port} ..."
+# ---------- 防火墙放行（可放行多个端口） ----------
+open_firewall_ports() {
+    local ports=("$@")
+    [[ ${#ports[@]} -eq 0 ]] && return 0
+    local port_list=""
+    local p
+    for p in "${ports[@]}"; do
+        [[ -z "$p" ]] && continue
+        port_list="${port_list} ${p}/tcp"
+    done
+    [[ -z "$port_list" ]] && return 0
+
+    echo_blue "正在放行防火墙端口:${port_list} ..."
     local done=0
 
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
-        ufw allow "${port}/tcp" >/dev/null 2>&1 && done=1
+        for p in "${ports[@]}"; do
+            [[ -n "$p" ]] && ufw allow "${p}/tcp" >/dev/null 2>&1
+        done
+        done=1
     fi
 
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1 && done=1
+        for p in "${ports[@]}"; do
+            [[ -n "$p" ]] && firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1
+        done
+        firewall-cmd --reload >/dev/null 2>&1
+        done=1
     fi
 
     if [[ $done -eq 0 ]]; then
         echo_yellow "未检测到已启用的 ufw / firewalld。"
-        echo_yellow "如果你的服务商有外部安全组，请手动放行 TCP ${port}。"
+        echo_yellow "如果你的服务商有安全组，请手动放行:${port_list}"
     else
-        echo_green "防火墙已放行 TCP ${port}。"
+        echo_green "防火墙已放行:${port_list}"
     fi
+}
+
+# ---------- 防火墙关闭某端口 ----------
+close_firewall_port() {
+    local port="$1"
+    [[ -z "$port" ]] && return 0
+    echo_blue "正在关闭防火墙对外端口 TCP ${port}（仅保留本地访问）..."
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
+        ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+        firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    echo_green "已处理端口 ${port}。"
 }
 
 # ---------- 下载并解压安装包 ----------
@@ -180,55 +226,54 @@ download_and_install() {
     mkdir -p "${tmp_dir}"
     cd "${tmp_dir}" || exit 1
 
-    echo_blue "正在从镜像仓库下载安装包..."
-    echo_cyan "  ${url}"
-    if ! curl -fLR --retry 3 --retry-delay 2 --connect-timeout 20 -o "${tarball}" "${url}"; then
-        echo_red "下载失败，请检查网络或稍后重试。"
-        cd / && rm -rf "${tmp_dir}"
-        exit 1
-    fi
+    echo ""
+    echo_cyan "[1/5] 下载安装包"
+    download_with_progress "${url}" "${tarball}"
     if [[ ! -s "${tarball}" ]]; then
-        echo_red "下载的安装包为空。"
-        cd / && rm -rf "${tmp_dir}"
-        exit 1
+        echo_red "下载失败或文件为空，请检查网络后重试。"
+        cd / && rm -rf "${tmp_dir}"; exit 1
     fi
+    echo_green "  ✓ 下载完成 ($(du -h "${tarball}" | cut -f1))"
 
-    # 校验 sha256（存在则校验）
+    echo ""
+    echo_cyan "[2/5] 校验安装包完整性"
     if curl -fsLR --retry 2 --connect-timeout 15 -o "${tarball}.sha256" "${sha_url}" 2>/dev/null; then
         local expected actual
         expected=$(awk 'NR==1{print $1}' "${tarball}.sha256")
         actual=$(sha256sum "${tarball}" | awk '{print $1}')
         if [[ "${expected}" == "${actual}" && -n "${actual}" ]]; then
-            echo_green "安装包完整性校验通过。"
+            echo_green "  ✓ 完整性校验通过"
         else
-            echo_red "安装包校验失败，可能被篡改，已中止。"
-            cd / && rm -rf "${tmp_dir}"
-            exit 1
+            echo_red "  ✗ 校验失败，安装包可能被篡改，已中止。"
+            cd / && rm -rf "${tmp_dir}"; exit 1
         fi
     else
-        echo_yellow "未获取到校验文件，跳过完整性校验。"
+        echo_yellow "  - 未获取到校验文件，跳过校验"
     fi
 
-    echo_blue "正在解压..."
+    echo ""
+    echo_cyan "[3/5] 解压安装包"
     tar -xzf "${tarball}" || { echo_red "解压失败。"; cd / && rm -rf "${tmp_dir}"; exit 1; }
+    echo_green "  ✓ 解压完成"
 
-    # 停旧服务
     if systemctl is-active --quiet "${xui_service_name}" 2>/dev/null; then
-        echo_blue "检测到旧面板，正在停止..."
+        echo_yellow "  检测到旧面板，正在停止..."
         systemctl stop "${xui_service_name}" >/dev/null 2>&1
     fi
 
-    # 解压后为 x-ui/ 目录
     cd x-ui || { echo_red "安装包结构异常。"; cd / && rm -rf "${tmp_dir}"; exit 1; }
     chmod +x x-ui bin/xray-linux-* 2>/dev/null || true
 
+    echo ""
+    echo_cyan "[4/5] 安装程序文件"
     mkdir -p "${xui_folder}"
     cp -f x-ui "${xui_folder}/x-ui"
     cp -rf bin "${xui_folder}/"
     [[ -f x-ui.sh ]] && cp -f x-ui.sh "${xui_folder}/x-ui.sh"
     chmod +x "${xui_folder}/x-ui" "${xui_folder}/x-ui.sh" 2>/dev/null || true
+    echo_green "  ✓ 程序文件已安装到 ${xui_folder}"
 
-    # 服务文件（包内自带三种）
+    # service 文件
     local svc_src=""
     case "${release}" in
         ubuntu | debian | armbian) svc_src="x-ui.service.debian" ;;
@@ -238,13 +283,91 @@ download_and_install() {
     if [[ -f "${svc_src}" ]]; then
         cp -f "${svc_src}" "${xui_service_folder}/${xui_service_name}.service"
     else
-        # 回退：从镜像仓库拉
         curl -fsLR -o "${xui_service_folder}/${xui_service_name}.service" \
             "${raw_base}/x-ui.service.debian" >/dev/null 2>&1 || true
     fi
+    echo_green "  ✓ 服务文件已配置"
+
+    # ★ 关键修复：注册 x-ui 命令到 /usr/bin
+    echo ""
+    echo_cyan "[5/5] 注册 x-ui 管理命令"
+    if [[ -f "${xui_folder}/x-ui.sh" ]]; then
+        cp -f "${xui_folder}/x-ui.sh" /usr/bin/x-ui
+        chmod +x /usr/bin/x-ui
+        echo_green "  ✓ 已注册命令: x-ui"
+        # 汉化管理菜单
+        localize_menu /usr/bin/x-ui
+    else
+        echo_yellow "  - 未找到 x-ui.sh，命令注册跳过"
+    fi
+    mkdir -p /var/log/x-ui
 
     cd / && rm -rf "${tmp_dir}"
-    echo_green "文件安装完成。"
+}
+
+# ---------- 汉化管理菜单 ----------
+localize_menu() {
+    local target="$1"
+    [[ ! -f "${target}" ]] && return 0
+    # 用 python3 做精确替换（若可用），否则用 sed 兜底
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "${target}" <<'PYEOF'
+import sys
+path = sys.argv[1]
+REPL = [
+    ("3X-UI Panel Management Script", "3X-UI 面板管理脚本 (FreeKm 中文版)"),
+    ("Update to Dev Channel (latest commit)", "更新到开发版 (最新提交)"),
+    ("Reset Username & Password", "重置用户名和密码"),
+    ("Reset Web Base Path", "重置访问路径"),
+    ("IP Limit Management", "IP 限制管理"),
+    ("Cloudflare SSL Certificate", "Cloudflare SSL 证书"),
+    ("SSL Certificate Management", "SSL 证书管理"),
+    ("SSH Port Forwarding Management", "SSH 端口转发管理"),
+    ("View Current Settings", "查看当前配置"),
+    ("Check Status", "查看状态"),
+    ("Logs Management", "日志管理"),
+    ("Enable Autostart", "开启开机自启"),
+    ("Disable Autostart", "关闭开机自启"),
+    ("PostgreSQL Management", "PostgreSQL 管理"),
+    ("Firewall Management", "防火墙管理"),
+    ("Update Geo Files", "更新 Geo 数据文件"),
+    ("Speedtest by Ookla", "Ookla 测速"),
+    ("Legacy Version", "历史版本"),
+    ("Update Menu", "更新菜单"),
+    ("Restart Xray", "重启 Xray"),
+    ("Enable BBR", "开启 BBR 加速"),
+    ("Exit Script", "退出脚本"),
+    ("Uninstall", "卸载"),
+    ("Install", "安装"),
+    ("Update", "更新"),
+    ("Restart", "重启"),
+    ("Change Port", "修改端口"),
+    ("Reset Settings", "重置配置"),
+    ("Start", "启动"),
+    ("Stop", "停止"),
+    ("Back to Main Menu", "返回主菜单"),
+    ("Updating Menu", "正在更新菜单"),
+    ("Please choose an option", "请选择操作"),
+    ("Panel state:", "面板状态:"),
+    ("Xray state:", "Xray 状态:"),
+    ("MTProto state:", "MTProto 状态:"),
+    ("Running", "运行中"),
+    ("Not Running", "未运行"),
+    ("Not Installed", "未安装"),
+    ("Please enter your selection", "请输入选项"),
+    ("The OS release is:", "当前系统:"),
+]
+with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+    c = f.read()
+for en, zh in REPL:
+    c = c.replace(en, zh)
+with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+    f.write(c)
+PYEOF
+        echo_green "  ✓ 管理菜单已汉化"
+    else
+        echo_yellow "  - 系统无 python3，管理菜单保留英文"
+    fi
 }
 
 # ---------- 获取最新版本 ----------
@@ -259,21 +382,191 @@ resolve_latest_tag() {
     echo "v3.9.0"
 }
 
-# ---------- 初始化面板配置 ----------
-init_panel_settings() {
+# ---------- 交互：数据库选择 ----------
+ask_database() {
+    echo ""
+    echo_cyan "======================================================"
+    echo_cyan "  请选择数据库类型"
+    echo_cyan "======================================================"
+    echo -e "${green}  1) SQLite${plain}      —— 单文件数据库，本机自带，零配置"
+    echo -e "${green}  2) PostgreSQL${plain}  —— 独立数据库服务，适合大量客户端"
+    echo ""
+    echo_yellow "  简单说："
+    echo -e "${blue}    · 就你自己一个人用 / 客户端没几个  → 选 ${green}1${plain}"
+    echo -e "${blue}    · 要给很多人用 / 节点多 / 追求稳定   → 选 ${green}2${plain}"
+    echo ""
+    local choice
+    read -rp "  请输入选项（直接回车默认选 1）: " choice
+    case "$choice" in
+        2) CHOICE_DB="postgres" ;;
+        *) CHOICE_DB="sqlite" ;;
+    esac
+    if [[ "${CHOICE_DB}" == "sqlite" ]]; then
+        echo_green "  已选择：SQLite（适合个人使用）"
+    else
+        echo_green "  已选择：PostgreSQL（适合多人使用）"
+    fi
+}
+
+# ---------- 交互：SSL 选择 ----------
+ask_ssl() {
+    echo ""
+    echo_cyan "======================================================"
+    echo_cyan "  请选择 SSL 证书方式（给面板加锁，防止被窃听）"
+    echo_cyan "======================================================"
+    echo -e "${green}  1) 域名证书${plain}   —— 需要你有域名，证书 90 天有效，自动续期"
+    echo -e "${green}  2) IP 证书${plain}     —— 用服务器 IP 申请，证书约 6 天有效，自动续期"
+    echo -e "${green}  3) 自有证书${plain}     —— 你已有证书文件，填路径即可"
+    echo -e "${green}  4) 不加证书（跳过）${plain} —— 面板走 HTTP，仅适合靠 SSH 隧道访问"
+    echo ""
+    echo_yellow "  打个比方："
+    echo -e "${blue}    · 有域名、想让别人也能 https 访问      → 选 ${green}1${plain}"
+    echo -e "${blue}    · 没域名，想用 https 直接访问 IP       → 选 ${green}2${plain}（推荐）"
+    echo -e "${blue}    · 已有证书文件                        → 选 ${green}3${plain}"
+    echo -e "${blue}    · 只想自己用、习惯走 SSH 隧道最安全    → 选 ${green}4${plain}"
+    echo ""
+    echo_yellow "  说明：选 1、2 需要放行 80 端口用于证书签发。"
+    local choice
+    read -rp "  请输入选项（直接回车默认选 4 跳过）: " choice
+    choice="${choice// /}"
+    case "$choice" in
+        1)
+            CHOICE_SSL="1"
+            local d
+            while :; do
+                read -rp "  请输入你的域名（例如 panel.example.com）: " d
+                d="${d// /}"
+                if [[ "$d" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                    SSL_DOMAIN="$d"; break
+                fi
+                echo_yellow "  域名格式不正确，请重新输入。"
+            done
+            echo_green "  已选择：域名证书（${SSL_DOMAIN}）"
+            ;;
+        2)
+            CHOICE_SSL="2"
+            echo_green "  已选择：IP 证书"
+            ;;
+        3)
+            CHOICE_SSL="3"
+            while :; do
+                read -rp "  请输入证书文件路径（.crt / .pem）: " SSL_CERT_PATH
+                [[ -f "$SSL_CERT_PATH" ]] && break
+                echo_yellow "  文件不存在，请重新输入。"
+            done
+            while :; do
+                read -rp "  请输入私钥文件路径（.key）: " SSL_KEY_PATH
+                [[ -f "$SSL_KEY_PATH" ]] && break
+                echo_yellow "  文件不存在，请重新输入。"
+            done
+            echo_green "  已选择：自有证书"
+            ;;
+        *)
+            CHOICE_SSL="4"
+            echo_green "  已选择：不加证书（HTTP，仅走 SSH 隧道）"
+            ;;
+    esac
+}
+
+# ---------- 交互：安全加固 ----------
+ask_security_hardening() {
+    echo ""
+    echo_cyan "======================================================"
+    echo_cyan "  安全加固（可选）"
+    echo_cyan "======================================================"
+    echo_yellow "  风险提示：如果 VPS 直接暴露在公网，SSH 和面板都可能被"
+    echo_yellow "  暴力破解。以下加固能显著降低风险："
+    echo -e "${blue}    · 安装 fail2ban：自动封禁多次登录失败的 IP${plain}"
+    echo ""
+    local choice
+    read -rp "  是否安装 fail2ban 防暴力破解？[y/N]: " choice
+    case "$choice" in
+        y|Y|yes|YES)
+            echo_blue "  正在安装 fail2ban..."
+            case "${release}" in
+                ubuntu|debian|armbian) apt-get install -y -q fail2ban >/dev/null 2>&1 ;;
+                centos|almalinux|rocky|rhel|fedora|amzn|ol)
+                    command -v dnf >/dev/null 2>&1 && dnf install -y -q fail2ban >/dev/null 2>&1 || yum install -y -q fail2ban >/dev/null 2>&1 ;;
+                *) echo_yellow "  未知系统，跳过 fail2ban 安装" ;;
+            esac
+            systemctl enable fail2ban >/dev/null 2>&1
+            systemctl restart fail2ban >/dev/null 2>&1
+            echo_green "  ✓ fail2ban 已安装并启用"
+            ;;
+        *)
+            echo_yellow "  - 已跳过 fail2ban。"
+            ;;
+    esac
+}
+
+# ---------- 应用面板配置 ----------
+apply_panel_settings() {
     local port="$1" user="$2" pass="$3" webpath="$4"
     mkdir -p /etc/x-ui
-
-    # 停止可能运行的进程后再设置
     "${xui_folder}/x-ui" setting -port "${port}" >/dev/null 2>&1 || true
     "${xui_folder}/x-ui" setting -username "${user}" >/dev/null 2>&1 || true
     "${xui_folder}/x-ui" setting -password "${pass}" >/dev/null 2>&1 || true
     "${xui_folder}/x-ui" setting -webBasePath "${webpath}" >/dev/null 2>&1 || true
 }
 
-# ---------- 生成安装结果 ----------
+# ---------- 简化版 SSL 应用（用 acme.sh）----------
+apply_ssl() {
+    local port="$1" domain="$2" ip="$3"
+    case "${CHOICE_SSL}" in
+        1|2)
+            echo_blue "  正在安装 acme.sh 并申请证书..."
+            if ! command -v ~/.acme.sh/acme.sh >/dev/null 2>&1 && [[ ! -f /root/.acme.sh/acme.sh ]]; then
+                curl -s https://get.acme.sh | sh >/dev/null 2>&1 || {
+                    echo_yellow "  acme.sh 安装失败，退回 HTTP 模式。"
+                    CHOICE_SSL="4"; return 1
+                }
+            fi
+            local ACME="/root/.acme.sh/acme.sh"
+            [[ ! -f "$ACME" ]] && ACME="$HOME/.acme.sh/acme.sh"
+            local target="${domain:-$ip}"
+            if [[ "${CHOICE_SSL}" == "2" ]]; then
+                echo_yellow "  IP 证书签发需要 80 端口可达，可能耗时较长..."
+                "$ACME" --issue -d "${ip}" --standalone --server letsencrypt --days 6 >/dev/null 2>&1 || {
+                    echo_yellow "  IP 证书签发失败（可能 80 端口不通），退回 HTTP 模式。"
+                    CHOICE_SSL="4"; return 1
+                }
+            else
+                echo_yellow "  域名证书签发需要 80 端口可达..."
+                "$ACME" --issue -d "${target}" --standalone >/dev/null 2>&1 || {
+                    echo_yellow "  域名证书签发失败（可能 80 端口不通），退回 HTTP 模式。"
+                    CHOICE_SSL="4"; return 1
+                }
+            fi
+            local cert_dir="/etc/x-ui/cert"
+            mkdir -p "${cert_dir}"
+            "$ACME" --install-cert -d "${target}" \
+                --key-file "${cert_dir}/privkey.pem" \
+                --fullchain-file "${cert_dir}/fullchain.pem" \
+                --reloadcmd "systemctl restart x-ui" >/dev/null 2>&1 || true
+            if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]]; then
+                "${xui_folder}/x-ui" cert -webCert "${cert_dir}/fullchain.pem" -webCertKey "${cert_dir}/privkey.pem" >/dev/null 2>&1 || true
+                echo_green "  ✓ 证书已申请并配置"
+                return 0
+            else
+                echo_yellow "  证书文件未生成，退回 HTTP 模式。"
+                CHOICE_SSL="4"; return 1
+            fi
+            ;;
+        3)
+            echo_blue "  正在配置自有证书..."
+            "${xui_folder}/x-ui" cert -webCert "${SSL_CERT_PATH}" -webCertKey "${SSL_KEY_PATH}" >/dev/null 2>&1 || true
+            echo_green "  ✓ 自有证书已配置"
+            ;;
+        *)
+            echo_yellow "  已跳过 SSL，面板使用 HTTP。"
+            ;;
+    esac
+    return 0
+}
+
+# ---------- 写安装结果 ----------
 write_install_result() {
-    local user="$1" pass="$2" port="$3" webpath="$4" ip="$5"
+    local user="$1" pass="$2" port="$3" webpath="$4" scheme="$5" ip="$6"
     local result_file="/etc/x-ui/install-result.env"
     mkdir -p /etc/x-ui
     {
@@ -281,7 +574,8 @@ write_install_result() {
         printf 'XUI_PASSWORD=%s\n' "$pass"
         printf 'XUI_PANEL_PORT=%s\n' "$port"
         printf 'XUI_WEB_BASE_PATH=%s\n' "$webpath"
-        printf 'XUI_ACCESS_URL=%s\n' "http://${ip}:${port}/${webpath}"
+        printf 'XUI_SSL_MODE=%s\n' "${CHOICE_SSL}"
+        printf 'XUI_ACCESS_URL=%s\n' "${scheme}://${ip}:${port}/${webpath}"
     } > "${result_file}"
     chmod 600 "${result_file}"
 }
@@ -300,7 +594,6 @@ main() {
     fi
     echo_green "CPU 架构：${machine_arch}"
 
-    # 检测公网 IP
     local server_ip
     server_ip=$(curl -s --connect-timeout 8 https://api4.ipify.org 2>/dev/null || \
                 curl -s --connect-timeout 8 https://ipv4.icanhazip.com 2>/dev/null)
@@ -310,18 +603,20 @@ main() {
 
     install_base_deps
 
-    # 解析版本
+    # 交互选择
+    ask_database
+    ask_ssl
+
+    # 版本
     local tag="${XUI_VERSION:-}"
-    if [[ -z "${tag}" ]]; then
-        echo_blue "正在获取最新版本..."
-        tag=$(resolve_latest_tag)
-    fi
+    [[ -z "${tag}" ]] && tag=$(resolve_latest_tag)
     echo_green "将安装版本：${tag}"
 
     download_and_install "${machine_arch}" "${tag}"
 
-    # ---- 面板参数：随机凭据 ----
-    echo_blue "正在生成安全的随机凭据..."
+    # 生成随机凭据
+    echo ""
+    echo_blue "正在生成安全随机凭据..."
     local config_username config_password config_port config_webpath
     config_username="${XUI_USERNAME:-$(gen_random_string ${RAND_USER_LEN})}"
     config_password="${XUI_PASSWORD:-$(gen_random_string ${RAND_PASS_LEN})}"
@@ -330,67 +625,81 @@ main() {
     if [[ -n "${XUI_PANEL_PORT:-}" ]]; then
         config_port="${XUI_PANEL_PORT}"
     else
-        # 随机挑一个未占用端口
         local tries=0
         while :; do
             config_port=$(( (RANDOM % 20000) + 20000 ))
-            if ! is_port_in_use "${config_port}"; then break; fi
-            tries=$((tries+1))
-            [[ $tries -gt 50 ]] && { config_port=54321; break; }
+            ! is_port_in_use "${config_port}" && break
+            tries=$((tries+1)); [[ $tries -gt 50 ]] && { config_port=54321; break; }
         done
     fi
 
-    # 写配置
-    init_panel_settings "${config_port}" "${config_username}" "${config_password}" "${config_webpath}"
+    apply_panel_settings "${config_port}" "${config_username}" "${config_password}" "${config_webpath}"
 
-    # 服务：开机自启 + 崩溃重启
+    # 启动服务
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable "${xui_service_name}" >/dev/null 2>&1
     systemctl restart "${xui_service_name}" >/dev/null 2>&1
     sleep 1
 
-    # 防火墙放行
-    open_firewall_port "${config_port}"
+    # SSL
+    local scheme="http"
+    apply_ssl "${config_port}" "${SSL_DOMAIN}" "${server_ip}" && true
+    [[ "${CHOICE_SSL}" != "4" ]] && scheme="https"
 
-    write_install_result "${config_username}" "${config_password}" "${config_port}" "${config_webpath}" "${server_ip}"
+    # 防火墙：443 始终放行；面板端口按 SSL 选择决定
+    local fw_ports=("443")
+    if [[ "${CHOICE_SSL}" == "4" ]]; then
+        # 跳过 SSL：面板端口不对公网放行，仅隧道
+        close_firewall_port "${config_port}"
+    else
+        fw_ports+=("${config_port}")
+    fi
+    open_firewall_ports "${fw_ports[@]}"
 
-    # ---- 中文结果展示 ----
+    write_install_result "${config_username}" "${config_password}" "${config_port}" "${config_webpath}" "${scheme}" "${server_ip}"
+
+    ask_security_hardening
+
+    # ---- 结果展示 ----
     echo ""
     echo_cyan "======================================================"
     if systemctl is-active --quiet "${xui_service_name}" 2>/dev/null; then
-        echo_green "        3x-ui 面板安装成功！"
+        echo_green "             3x-ui 面板安装成功！"
     else
         echo_yellow "        服务已安装，但状态异常，请运行：systemctl status x-ui"
     fi
     echo_cyan "======================================================"
     echo ""
-    echo -e "${green}  面板地址${plain} : ${cyan}http://${server_ip}:${config_port}/${config_webpath}${plain}"
+    echo_cyan "  ---- 账号信息（请立即保存）----"
+    echo -e "${green}  访问协议${plain} : ${scheme}"
+    echo -e "${green}  面板地址${plain} : ${cyan}${scheme}://${server_ip}:${config_port}/${config_webpath}${plain}"
     echo -e "${green}  端口    ${plain} : ${config_port}"
     echo -e "${green}  访问路径${plain} : /${config_webpath}"
     echo -e "${green}  用户名  ${plain} : ${config_username}"
     echo -e "${green}  密码    ${plain} : ${config_password}"
+    echo -e "${green}  数据库  ${plain} : ${CHOICE_DB}"
     echo ""
     echo_yellow "  ★ 请立即保存以上信息，凭据不会再次显示！"
-    echo_yellow "  ★ 凭据也保存在：/etc/x-ui/install-result.env"
+    echo_yellow "  ★ 凭据保存在：/etc/x-ui/install-result.env"
+
+    # 隧道提示：仅当跳过 SSL 时
+    if [[ "${CHOICE_SSL}" == "4" ]]; then
+        echo ""
+        echo_cyan "  ---- 访问方式：SSH 隧道（已跳过 SSL）----"
+        echo_yellow "  由于未配置 SSL，面板未对公网开放端口，请用 SSH 隧道访问："
+        echo -e "${blue}    ssh -L ${config_port}:127.0.0.1:${config_port} root@${server_ip} -p <你的SSH端口>${plain}"
+        echo -e "${blue}  然后浏览器打开：${plain}http://127.0.0.1:${config_port}/${config_webpath}"
+    else
+        echo ""
+        echo_cyan "  ---- 访问方式：直接用浏览器打开上面的面板地址即可 ----"
+    fi
+
     echo ""
     echo_cyan "  ---- 管理命令 ----"
     echo -e "${blue}  运行管理菜单 : ${plain}x-ui"
     echo -e "${blue}  查看服务状态 : ${plain}systemctl status x-ui"
     echo -e "${blue}  重启面板     : ${plain}systemctl restart x-ui"
     echo -e "${blue}  查看实时日志 : ${plain}journalctl -u x-ui -f"
-    echo ""
-    echo_cyan "  ---- SSH 隧道访问（推荐，最安全）----"
-    echo -e "${blue}  如果不想暴露面板端口，可在本机建立 SSH 隧道后访问：${plain}"
-    echo -e "${blue}    ssh -L ${config_port}:127.0.0.1:${config_port} root@${server_ip} -p <你的SSH端口>${plain}"
-    echo -e "${blue}  然后浏览器打开：${plain}http://127.0.0.1:${config_port}/${config_webpath}"
-    echo_yellow "  （走隧道时无需对外放行面板端口，可关闭防火墙对该端口的暴露）"
-    echo ""
-    echo_cyan "  ---- 安全加固建议 ----"
-    echo -e "${blue}  1) 修改 SSH 密码并禁用密码登录，改用密钥：${plain}"
-    echo -e "${blue}     passwd ; 编辑 /etc/ssh/sshd_config 设置 PasswordAuthentication no${plain}"
-    echo -e "${blue}  2) 安装 fail2ban 防暴力破解：${plain}"
-    echo -e "${blue}     apt install -y fail2ban   （或 yum install -y fail2ban）${plain}"
-    echo -e "${blue}  3) 定期更新面板：${plain}x-ui 菜单选择更新，或运行 update.sh"
     echo ""
     echo_cyan "  镜像仓库: https://github.com/${mirror_repo}"
     echo_cyan "  项目主页: https://freekm.com"
