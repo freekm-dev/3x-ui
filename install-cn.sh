@@ -39,8 +39,8 @@ NEED_PORT_80=""   # 选 1/2 时置 1，安装完成后统一放行 80
 # 运行环境信息（全局）
 MACHINE_ARCH=""
 SERVER_IP=""
-SSH_PORT="22"
-SSH_PORTS="22"
+SSH_PORT=""     # 运行期动态检测；空 = 未检测到 SSH 服务
+SSH_PORTS=""    # 同上，可能为多端口
 
 # ---------- 输出辅助 ----------
 echo_red()    { echo -e "${red}$*${plain}"; }
@@ -858,6 +858,32 @@ write_install_result() {
     chmod 600 "${result_file}"
 }
 
+# ---------- 检测 sshd 服务状态 ----------
+# 输出：running / installed / absent
+ssh_service_status() {
+    # 1) 有 sshd 进程在运行（最可靠：真能连上的就是它）
+    if ss -ltnp 2>/dev/null | grep -qi sshd; then
+        echo "running"; return 0
+    fi
+    if command -v netstat >/dev/null 2>&1 && netstat -ltnp 2>/dev/null | grep -qi sshd; then
+        echo "running"; return 0
+    fi
+    # 2) systemd 判定
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+            echo "running"; return 0
+        fi
+        if systemctl list-unit-files 2>/dev/null | grep -qE '^\s*(ssh|sshd)\.service'; then
+            echo "installed"; return 0
+        fi
+    fi
+    # 3) 二进制存在视为已安装（但未运行）
+    if command -v sshd >/dev/null 2>&1 || [[ -x /usr/sbin/sshd ]]; then
+        echo "installed"; return 0
+    fi
+    echo "absent"
+}
+
 # ---------- 检测 SSH 端口（动态：优先实际监听，其次配置）----------
 detect_ssh_port() {
     local port=""
@@ -876,8 +902,7 @@ detect_ssh_port() {
     if [[ -z "$port" ]] && [[ -d /etc/ssh/sshd_config.d ]]; then
         port=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
     fi
-    # 4) 兜底默认 22
-    [[ -z "$port" ]] && port="22"
+    # 4) 未检测到 SSH 服务时返回空（不再假装 22，避免误导）
     echo "$port"
 }
 
@@ -891,6 +916,7 @@ detect_all_ssh_ports() {
         ports=$(netstat -ltnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -un)
     fi
     if [[ -z "$ports" ]]; then
+        # 未在监听时，回落到配置里的端口；仍为空则说明无 SSH
         ports=$(detect_ssh_port)
     fi
     echo "$ports" | tr '\n' ' ' | sed 's/ *$//'
@@ -935,12 +961,22 @@ show_system_info_and_confirm() {
     echo -e "${green}  内核版本  ${plain}: $(uname -r)"
     echo -e "${green}  CPU 架构  ${plain}: ${MACHINE_ARCH} ($(uname -m))"
     echo -e "${green}  公网 IP   ${plain}: ${SERVER_IP}"
-    echo -e "${green}  SSH 端口  ${plain}: ${SSH_PORT}"
+
+    local ssh_stat
+    ssh_stat=$(ssh_service_status)
+    if [[ "${ssh_stat}" == "running" ]]; then
+        echo -e "${green}  SSH 端口  ${plain}: ${SSH_PORT}"
+    else
+        echo -e "${green}  SSH 服务  ${plain}: 未检测到（你将通过 VNC / 物理终端等方式操作）"
+    fi
     echo -e "${green}  镜像仓库  ${plain}: https://github.com/${mirror_repo}"
     echo ""
 
-    # SSH 端口放行检查（动态，支持多端口）
-    if firewall_active; then
+    # SSH 端口放行检查：仅在确认存在 SSH 服务时执行
+    if [[ "${ssh_stat}" != "running" ]]; then
+        echo_yellow "  ! 未检测到正在运行的 SSH 服务，跳过 SSH 端口放行检查。"
+        echo_yellow "    （若你实际通过 SSH 连接，说明检测有误，请忽略此项）"
+    elif firewall_active; then
         local blocked=""
         local sp
         for sp in ${SSH_PORTS}; do
@@ -1009,7 +1045,10 @@ main() {
 
     SSH_PORT=$(detect_ssh_port)
     SSH_PORTS=$(detect_all_ssh_ports)
-    [[ -z "${SSH_PORTS}" ]] && SSH_PORTS="${SSH_PORT}"
+    # 未检测到 SSH 服务时 SSH_PORT 为空，SSH_PORTS 亦为空 -> 不要伪造 22
+    if [[ -z "${SSH_PORT}" ]] && [[ -n "${SSH_PORTS}" ]]; then
+        SSH_PORT="${SSH_PORTS%% *}"
+    fi
 
     # ★ 首屏：展示系统配置 + 安装确认（未确认不进入下一步）
     show_system_info_and_confirm
@@ -1132,9 +1171,14 @@ main() {
         echo ""
         echo_cyan "  ---- 访问方式：SSH 隧道（已跳过 SSL）----"
         echo_yellow "  由于未配置 SSL，面板未对公网开放端口，请用 SSH 隧道访问："
-        echo -e "${blue}    ssh -L ${config_port}:127.0.0.1:${config_port} root@${SERVER_IP} -p ${SSH_PORT}${plain}"
+        if [[ -n "${SSH_PORT}" ]]; then
+            echo -e "${blue}    ssh -L ${config_port}:127.0.0.1:${config_port} root@${SERVER_IP} -p ${SSH_PORT}${plain}"
+        else
+            echo -e "${blue}    ssh -L ${config_port}:127.0.0.1:${config_port} root@${SERVER_IP}${plain}"
+            echo_yellow "    （未检测到 SSH 服务端口，未加 -p 参数；如你的 SSH 不是 22，请自行补 -p <端口>）"
+        fi
         echo -e "${blue}  然后浏览器打开：${plain}http://127.0.0.1:${config_port}/${config_webpath}"
-        if firewall_active && ! ssh_port_is_allowed "${SSH_PORT}"; then
+        if [[ -n "${SSH_PORT}" ]] && firewall_active && ! ssh_port_is_allowed "${SSH_PORT}"; then
             echo ""
             echo_red "  ⚠ 警告：检测到 SSH 端口 ${SSH_PORT} 未放行，请先放行再断开连接，"
             echo_red "     否则会把自己拦在外面！"
