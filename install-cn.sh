@@ -39,6 +39,7 @@ SSL_KEY_PATH=""
 MACHINE_ARCH=""
 SERVER_IP=""
 SSH_PORT="22"
+SSH_PORTS="22"
 
 # ---------- 输出辅助 ----------
 echo_red()    { echo -e "${red}$*${plain}"; }
@@ -838,26 +839,42 @@ write_install_result() {
     chmod 600 "${result_file}"
 }
 
-# ---------- 检测 SSH 端口 ----------
+# ---------- 检测 SSH 端口（动态：优先实际监听，其次配置）----------
 detect_ssh_port() {
     local port=""
-    # 1) 从 sshd_config 读取（可能被注释）
-    if [[ -f /etc/ssh/sshd_config ]]; then
+    # 1) 最可靠：从实际监听的 sshd 进程反查（这才是真正能连上的端口）
+    if command -v ss >/dev/null 2>&1; then
+        port=$(ss -ltnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | head -1 | tr -d ':')
+    fi
+    if [[ -z "$port" ]] && command -v netstat >/dev/null 2>&1; then
+        port=$(netstat -ltnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | head -1 | tr -d ':')
+    fi
+    # 2) 其次：sshd_config 里的 Port 配置
+    if [[ -z "$port" ]] && [[ -f /etc/ssh/sshd_config ]]; then
         port=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
     fi
-    # 2) 从 sshd_config.d/*.conf 读取
+    # 3) 再次：sshd_config.d/*.conf 里的 Port 配置
     if [[ -z "$port" ]] && [[ -d /etc/ssh/sshd_config.d ]]; then
         port=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
-    fi
-    # 3) 从实际监听进程反查（最可靠）
-    if [[ -z "$port" ]]; then
-        if command -v ss >/dev/null 2>&1; then
-            port=$(ss -ltnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | head -1 | tr -d ':')
-        fi
     fi
     # 4) 兜底默认 22
     [[ -z "$port" ]] && port="22"
     echo "$port"
+}
+
+# 检测所有正在监听的 SSH 端口（可能多个，如 22 与 2222）
+detect_all_ssh_ports() {
+    local ports=""
+    if command -v ss >/dev/null 2>&1; then
+        ports=$(ss -ltnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -un)
+    fi
+    if [[ -z "$ports" ]] && command -v netstat >/dev/null 2>&1; then
+        ports=$(netstat -ltnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -un)
+    fi
+    if [[ -z "$ports" ]]; then
+        ports=$(detect_ssh_port)
+    fi
+    echo "$ports" | tr '\n' ' ' | sed 's/ *$//'
 }
 
 # 检查某端口是否被防火墙放行
@@ -903,17 +920,28 @@ show_system_info_and_confirm() {
     echo -e "${green}  镜像仓库  ${plain}: https://github.com/${mirror_repo}"
     echo ""
 
-    # SSH 端口放行检查
+    # SSH 端口放行检查（动态，支持多端口）
     if firewall_active; then
-        if ssh_port_is_allowed "${SSH_PORT}"; then
-            echo_green "  ✔ 检测到防火墙已放行 SSH 端口 ${SSH_PORT}"
+        local blocked=""
+        local sp
+        for sp in ${SSH_PORTS}; do
+            if ! ssh_port_is_allowed "${sp}"; then
+                blocked="${blocked} ${sp}"
+            fi
+        done
+        blocked="${blocked# }"
+        if [[ -z "${blocked}" ]]; then
+            echo_green "  ✔ 检测到防火墙已放行 SSH 端口: ${SSH_PORTS}"
         else
             echo ""
-            echo_red   "  ⚠ 警告：检测到 SSH 端口 ${SSH_PORT} 未在防火墙中放行！"
+            echo_red   "  ⚠ 警告：检测到 SSH 端口 ${blocked} 未在防火墙中放行！"
             echo_red   "     如果你在安装过程中断开连接，可能会被挡在外面无法重连！"
             echo_yellow "     请先放行 SSH 端口再继续，例如："
-            echo_yellow "       ufw allow ${SSH_PORT}/tcp        （Ubuntu/Debian）"
-            echo_yellow "       firewall-cmd --permanent --add-port=${SSH_PORT}/tcp && firewall-cmd --reload"
+            local bp
+            for bp in ${blocked}; do
+                echo_yellow "       ufw allow ${bp}/tcp        （Ubuntu/Debian）"
+                echo_yellow "       firewall-cmd --permanent --add-port=${bp}/tcp && firewall-cmd --reload"
+            done
             echo ""
             local aw
             read -rp "  仍要继续安装吗？(y 继续 / 其它键退出先去放行): " aw
@@ -923,7 +951,7 @@ show_system_info_and_confirm() {
             esac
         fi
     else
-        echo_yellow "  ! 未检测到已启用的 ufw / firewalld 防火墙（如为云服务商安全组，请自行确认 ${SSH_PORT} 已放行）"
+        echo_yellow "  ! 未检测到已启用的 ufw / firewalld 防火墙（如为云服务商安全组，请自行确认 ${SSH_PORTS} 已放行）"
     fi
 
     echo ""
@@ -961,6 +989,8 @@ main() {
     [[ -z "${SERVER_IP}" ]] && SERVER_IP="<你的服务器IP>"
 
     SSH_PORT=$(detect_ssh_port)
+    SSH_PORTS=$(detect_all_ssh_ports)
+    [[ -z "${SSH_PORTS}" ]] && SSH_PORTS="${SSH_PORT}"
 
     # ★ 首屏：展示系统配置 + 安装确认（未确认不进入下一步）
     show_system_info_and_confirm
