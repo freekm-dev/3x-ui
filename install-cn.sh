@@ -731,6 +731,18 @@ apply_panel_settings() {
 apply_ssl() {
     local port="$1" domain="$2" ip="$3"
 
+    # ★ 先清除上一次安装残留的证书配置，保证本次选择生效
+    # （否则若上次配了 HTTPS、这次选"不加证书"，面板仍会沿用旧证书）
+    if [[ "${CHOICE_SSL}" == "4" ]]; then
+        # 选"不加证书"：清空面板证书路径 + 删除旧证书文件，回到纯 HTTP
+        "${xui_folder}/x-ui" cert -webCert "" -webCertKey "" >/dev/null 2>&1 || true
+        rm -rf /etc/x-ui/cert >/dev/null 2>&1 || true
+        echo_yellow "  已跳过 SSL，面板使用 HTTP（已清除历史证书配置）。"
+        return 1
+    fi
+    # 选 1/2/3：清掉旧证书文件，避免残留干扰
+    rm -rf /etc/x-ui/cert >/dev/null 2>&1 || true
+
     # 先确保 acme.sh 就绪
     if [[ "${CHOICE_SSL}" == "1" || "${CHOICE_SSL}" == "2" ]]; then
         if [[ ! -f "${HOME}/.acme.sh/acme.sh" ]]; then
