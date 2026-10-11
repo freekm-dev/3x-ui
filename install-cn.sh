@@ -35,6 +35,11 @@ SSL_DOMAIN=""
 SSL_CERT_PATH=""
 SSL_KEY_PATH=""
 
+# 运行环境信息（全局）
+MACHINE_ARCH=""
+SERVER_IP=""
+SSH_PORT="22"
+
 # ---------- 输出辅助 ----------
 echo_red()    { echo -e "${red}$*${plain}"; }
 echo_green()  { echo -e "${green}$*${plain}"; }
@@ -374,87 +379,197 @@ download_and_install() {
     cd / && rm -rf "${tmp_dir}"
 }
 
-# ---------- 汉化管理菜单 ----------
+# ---------- 汉化管理菜单（整体重写 show_menu，修复边框 + 精简菜单项）----------
 localize_menu() {
     local target="$1"
     [[ ! -f "${target}" ]] && return 0
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "${target}" <<'PYEOF' >/dev/null 2>&1 || true
-import sys
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+    python3 - "${target}" <<'PYEOF' >/dev/null 2>&1 || true
+import sys, re
+
 path = sys.argv[1]
+with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+    c = f.read()
+
+NEW_MENU = r"""show_menu() {
+    echo -e "
+╔══════════════════════════════════════════════╗
+│  ${green}3X-UI 面板管理脚本 (FreeKm 中文版)${plain}          │
+│  ${green}0.${plain} 退出脚本                                 │
+│──────────────────────────────────────────────│
+│  ${green}1.${plain} 重置用户名和密码                         │
+│  ${green}2.${plain} 重置访问路径                             │
+│  ${green}3.${plain} 重置配置                                 │
+│  ${green}4.${plain} 修改端口                                 │
+│  ${green}5.${plain} 查看当前配置                             │
+│──────────────────────────────────────────────│
+│  ${green}6.${plain} 启动                                     │
+│  ${green}7.${plain} 停止                                     │
+│  ${green}8.${plain} 重启                                     │
+│  ${green}9.${plain} 重启 Xray                                │
+│  ${green}10.${plain} 查看状态                                │
+│  ${green}11.${plain} 日志管理                                │
+│──────────────────────────────────────────────│
+│  ${green}12.${plain} 开启开机自启                            │
+│  ${green}13.${plain} 关闭开机自启                            │
+│──────────────────────────────────────────────│
+│  ${green}14.${plain} SSL 证书管理                            │
+│  ${green}15.${plain} Cloudflare SSL 证书                     │
+│  ${green}16.${plain} IP 限制管理                             │
+│  ${green}17.${plain} 防火墙管理                              │
+│  ${green}18.${plain} SSH 端口转发管理                        │
+│  ${green}19.${plain} PostgreSQL 管理                         │
+│──────────────────────────────────────────────│
+│  ${green}20.${plain} 开启 BBR 加速                           │
+│  ${green}21.${plain} 更新 Geo 数据文件                       │
+│  ${green}22.${plain} Ookla 测速                              │
+╚══════════════════════════════════════════════╝
+"
+    show_status
+    echo && read -rp "请输入选项 [0-22]: " num
+
+    case "${num}" in
+        0)
+            exit 0
+            ;;
+        1)
+            check_install && reset_user
+            ;;
+        2)
+            check_install && reset_webbasepath
+            ;;
+        3)
+            check_install && reset_config
+            ;;
+        4)
+            check_install && set_port
+            ;;
+        5)
+            check_install && check_config
+            ;;
+        6)
+            check_install && start
+            ;;
+        7)
+            check_install && stop
+            ;;
+        8)
+            check_install && restart
+            ;;
+        9)
+            check_install && restart_xray
+            ;;
+        10)
+            check_install && status
+            ;;
+        11)
+            check_install && show_log
+            ;;
+        12)
+            check_install && enable
+            ;;
+        13)
+            check_install && disable
+            ;;
+        14)
+            ssl_cert_issue_main
+            ;;
+        15)
+            ssl_cert_issue_CF
+            ;;
+        16)
+            iplimit_main
+            ;;
+        17)
+            firewall_menu
+            ;;
+        18)
+            SSH_port_forwarding
+            ;;
+        19)
+            postgresql_menu
+            ;;
+        20)
+            bbr_menu
+            ;;
+        21)
+            update_geo
+            ;;
+        22)
+            run_speedtest
+            ;;
+        *)
+            LOGE "请输入正确的选项 [0-22]"
+            ;;
+    esac
+}"""
+
+
+def replace_func(content, name, new_text):
+    """定位函数定义并整体替换到匹配的右花括号。
+    必须匹配行首的 name() {，避免误中 before_show_menu() 之类。"""
+    m = re.search(r"(?m)^" + re.escape(name) + r"\(\) \{", content)
+    if not m:
+        return content
+    start = m.start()
+    depth = 1
+    i = content.find("{", start) + 1
+    while i < len(content):
+        if content[i] == "{":
+            depth += 1
+        elif content[i] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    if i >= len(content):
+        return content
+    return content[:start] + new_text + content[i + 1:]
+
+
+# 1) 整体重写主菜单（修复边框 + 去掉更新/卸载等无意义项）
+c = replace_func(c, "show_menu", NEW_MENU)
+
+# 2) 状态行 & 常用 UI 文案定点替换（长串优先）
 REPL = [
-    ("3X-UI Panel Management Script", "3X-UI 面板管理脚本 (FreeKm 中文版)"),
-    ("Update to Dev Channel (latest commit)", "更新到开发版 (最新提交)"),
-    ("Reset Username & Password", "重置用户名和密码"),
-    ("Reset Web Base Path", "重置访问路径"),
-    ("IP Limit Management", "IP 限制管理"),
-    ("Cloudflare SSL Certificate", "Cloudflare SSL 证书"),
-    ("SSL Certificate Management", "SSL 证书管理"),
-    ("SSH Port Forwarding Management", "SSH 端口转发管理"),
-    ("View Current Settings", "查看当前配置"),
-    ("Check Status", "查看状态"),
-    ("Logs Management", "日志管理"),
-    ("Enable Autostart", "开启开机自启"),
-    ("Disable Autostart", "关闭开机自启"),
-    ("PostgreSQL Management", "PostgreSQL 管理"),
-    ("Firewall Management", "防火墙管理"),
-    ("Update Geo Files", "更新 Geo 数据文件"),
-    ("Speedtest by Ookla", "Ookla 测速"),
-    ("Legacy Version", "历史版本"),
-    ("Update Menu", "更新菜单"),
-    ("Restart Xray", "重启 Xray"),
-    ("Enable BBR", "开启 BBR 加速"),
-    ("Exit Script", "退出脚本"),
-    ("Uninstall", "卸载"),
-    ("Install", "安装"),
-    ("Update", "更新"),
-    ("Restart", "重启"),
-    ("Change Port", "修改端口"),
-    ("Reset Settings", "重置配置"),
-    ("Start", "启动"),
-    ("Stop", "停止"),
-    ("Back to Main Menu", "返回主菜单"),
-    ("Updating Menu", "正在更新菜单"),
-    ("Please choose an option", "请选择操作"),
+    ('echo -e "Panel state: ${green}Running${plain}"', 'echo -e "面板状态: ${green}运行中${plain}"'),
+    ('echo -e "Panel state: ${yellow}Not Running${plain}"', 'echo -e "面板状态: ${yellow}未运行${plain}"'),
+    ('echo -e "Panel state: ${red}Not Installed${plain}"', 'echo -e "面板状态: ${red}未安装${plain}"'),
+    ('echo -e "Xray 状态: ${green}Running${plain}"', 'echo -e "Xray 状态: ${green}运行中${plain}"'),
+    ('echo -e "Xray 状态: ${red}Not Running${plain}"', 'echo -e "Xray 状态: ${red}未运行${plain}"'),
+    ('echo -e "Xray state:', 'echo -e "Xray 状态:'),
+    ('echo -e "xray state:', 'echo -e "Xray 状态:'),
+    ('echo -e "MTProto state:', 'echo -e "MTProto 状态:'),
+    ('Start automatically: ${green}Managed by Docker${plain}', '开机自启: ${green}由 Docker 托管${plain}'),
+    ('Start automatically: ${green}Yes${plain}', '开机自启: ${green}是${plain}'),
+    ('Start automatically: ${red}No${plain}', '开机自启: ${red}否${plain}'),
+    ('echo -e "启动 automatically:', 'echo -e "开机自启:'),
+    ('echo -e "Enabled: ${green}Yes${plain}"', 'echo -e "开机自启: ${green}是${plain}"'),
+    ('echo -e "Enabled: ${red}No${plain}"', 'echo -e "开机自启: ${red}否${plain}"'),
     ("Panel state:", "面板状态:"),
     ("Xray state:", "Xray 状态:"),
     ("xray state:", "Xray 状态:"),
-    ("启动 automatically:", "开机自启:"),
-    ("automatically:", "开机自启:"),
-    ("开机自启: Yes", "开机自启: 是"),
-    ("开机自启: No", "开机自启: 否"),
     ("MTProto state:", "MTProto 状态:"),
-    ("Running", "运行中"),
-    ("Not Running", "未运行"),
-    ("Not Installed", "未安装"),
+    ("Start automatically:", "开机自启:"),
+    ("automatically: Yes", "开机自启: 是"),
+    ("automatically: No", "开机自启: 否"),
+    ("${green}Running${plain}", "${green}运行中${plain}"),
+    ("${red}Not Running${plain}", "${red}未运行${plain}"),
+    ("${yellow}Not Running${plain}", "${yellow}未运行${plain}"),
+    ("${red}Not Installed${plain}", "${red}未安装${plain}"),
     ("Please enter your selection", "请输入选项"),
+    ("Please enter the correct number", "请输入正确的选项"),
     ("The OS release is:", "当前系统:"),
-    ("Failed to start", "启动失败"),
-    ("Failed to", "操作失败："),
-    ("Successfully", "操作成功"),
-    ("Are you sure", "你确定要"),
-    ("y/n", "y/n"),
-    ("Please enter", "请输入"),
-    ("Invalid", "无效输入"),
-    ("Cancelled", "已取消"),
-    ("Done", "完成"),
-    ("Exiting", "正在退出"),
     ("Press Enter to continue", "按回车键继续"),
-    ("Enable", "开启"),
-    ("Disable", "关闭"),
-    ("Local time", "本机时间"),
-    ("System time", "系统时间"),
-    ("Version", "版本"),
 ]
-with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
-    c = f.read()
 for en, zh in REPL:
     c = c.replace(en, zh)
+
 with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
     f.write(c)
 PYEOF
-        return 0
-    fi
     return 0
 }
 
@@ -563,36 +678,6 @@ ask_ssl() {
     esac
 }
 
-# ---------- 交互：安装前确认 ----------
-ask_confirm() {
-    echo ""
-    echo_cyan "======================================================"
-    echo_cyan "  安装前确认"
-    echo_cyan "======================================================"
-    echo -e "${blue}  数据库  : ${plain}${CHOICE_DB}"
-    case "${CHOICE_SSL}" in
-        1) echo -e "${blue}  SSL     : ${plain}域名证书 (${SSL_DOMAIN})" ;;
-        2) echo -e "${blue}  SSL     : ${plain}IP 证书" ;;
-        3) echo -e "${blue}  SSL     : ${plain}自有证书" ;;
-        *) echo -e "${blue}  SSL     : ${plain}不加证书（仅 SSH 隧道访问）" ;;
-    esac
-    echo ""
-    echo_yellow "  以上配置将开始安装 3x-ui 面板，是否继续？"
-    local choice
-    read -rp "  输入 y 确认安装，输入 n 取消（直接回车默认确认）: " choice
-    choice="${choice// /}"
-    case "$choice" in
-        n|N|no|NO)
-            echo_yellow "  已取消安装。"
-            exit 0
-            ;;
-        *)
-            echo_green "  已确认，开始安装..."
-            return 0
-            ;;
-    esac
-}
-
 # ---------- 交互：安全加固 ----------
 ask_security_hardening() {
     echo ""
@@ -640,58 +725,101 @@ apply_panel_settings() {
     "${xui_folder}/x-ui" setting -webBasePath "${webpath}" >/dev/null 2>&1 || true
 }
 
-# ---------- 简化版 SSL 应用（用 acme.sh）----------
+# ---------- SSL 应用（用 acme.sh，参照官方实现）----------
+# 返回 0 表示已成功配置证书，返回 1 表示退回 HTTP
 apply_ssl() {
     local port="$1" domain="$2" ip="$3"
-    case "${CHOICE_SSL}" in
-        1|2)
-            spin_run "安装 acme.sh 证书工具..." "acme.sh 已就绪" "acme.sh 安装失败" \
-                bash -c 'curl -s https://get.acme.sh | sh'
-            local ACME="/root/.acme.sh/acme.sh"
-            [[ ! -f "$ACME" ]] && ACME="$HOME/.acme.sh/acme.sh"
-            if [[ ! -f "$ACME" ]]; then
-                echo_yellow "  ! 未找到 acme.sh，退回 HTTP 模式。"
+
+    # 先确保 acme.sh 就绪
+    if [[ "${CHOICE_SSL}" == "1" || "${CHOICE_SSL}" == "2" ]]; then
+        if [[ ! -f "${HOME}/.acme.sh/acme.sh" ]]; then
+            echo_blue "  正在安装 acme.sh 证书工具..."
+            if ! curl -s https://get.acme.sh | sh >/dev/null 2>&1; then
+                echo_yellow "  ! acme.sh 安装失败，退回 HTTP 模式。"
                 CHOICE_SSL="4"; return 1
             fi
-            local target="${domain:-$ip}"
-            if [[ "${CHOICE_SSL}" == "2" ]]; then
-                echo_blue "  正在申请 IP 证书（需要 80 端口可达，可能耗时较长）..."
-                if ! "$ACME" --issue -d "${ip}" --standalone --server letsencrypt --days 6 >/dev/null 2>&1; then
-                    echo_yellow "  ! IP 证书签发失败（可能 80 端口不通），退回 HTTP 模式。"
+        fi
+        local ACME="${HOME}/.acme.sh/acme.sh"
+        if [[ ! -f "$ACME" ]]; then
+            echo_yellow "  ! 未找到 acme.sh，退回 HTTP 模式。"
+            CHOICE_SSL="4"; return 1
+        fi
+
+        local cert_dir="/etc/x-ui/cert"
+        mkdir -p "${cert_dir}"
+        local reload_cmd="systemctl restart x-ui"
+
+        case "${CHOICE_SSL}" in
+            1)
+                # ---- 域名证书 ----
+                local target="${domain}"
+                echo_blue "  正在申请域名证书：${target}（需要 80 端口可达）..."
+                "$ACME" --set-default-ca --server letsencrypt --force >/dev/null 2>&1 || true
+                local err_log="/tmp/acme-domain.log"
+                if ! "$ACME" --issue -d "${target}" --standalone --httpport 80 --force >"${err_log}" 2>&1; then
+                    echo_red "  ✘ 域名证书签发失败。"
+                    echo_yellow "    可能原因：80 端口不通 / 域名未解析到本机 / 防火墙拦截"
+                    echo_yellow "    详细日志：${err_log}"
+                    tail -n 3 "${err_log}" 2>/dev/null | sed 's/^/      /'
                     CHOICE_SSL="4"; return 1
                 fi
-            else
-                echo_blue "  正在申请域名证书（需要 80 端口可达）..."
-                if ! "$ACME" --issue -d "${target}" --standalone >/dev/null 2>&1; then
-                    echo_yellow "  ! 域名证书签发失败（可能 80 端口不通），退回 HTTP 模式。"
+                "$ACME" --installcert --force -d "${target}" \
+                    --key-file "${cert_dir}/privkey.pem" \
+                    --fullchain-file "${cert_dir}/fullchain.pem" \
+                    --reloadcmd "${reload_cmd}" >/dev/null 2>&1 || true
+                ;;
+            2)
+                # ---- IP 证书（shortlived profile，约 6 天有效，自动续期）----
+                echo_blue "  正在申请 IP 证书：${ip}（需要 80 端口可达，约 6 天有效）..."
+                "$ACME" --set-default-ca --server letsencrypt --force >/dev/null 2>&1 || true
+                local err_log="/tmp/acme-ip.log"
+                if ! "$ACME" --issue -d "${ip}" --standalone \
+                        --server letsencrypt \
+                        --certificate-profile shortlived \
+                        --days 6 --httpport 80 --force >"${err_log}" 2>&1; then
+                    echo_red "  ✘ IP 证书签发失败。"
+                    echo_yellow "    可能原因：80 端口不通 / 安全组未放行 / Let's Encrypt 短证书限流"
+                    echo_yellow "    详细日志：${err_log}"
+                    tail -n 3 "${err_log}" 2>/dev/null | sed 's/^/      /'
+                    rm -rf ~/.acme.sh/${ip} ~/.acme.sh/${ip}_ecc 2>/dev/null
                     CHOICE_SSL="4"; return 1
                 fi
-            fi
-            local cert_dir="/etc/x-ui/cert"
-            mkdir -p "${cert_dir}"
-            "$ACME" --install-cert -d "${target}" \
-                --key-file "${cert_dir}/privkey.pem" \
-                --fullchain-file "${cert_dir}/fullchain.pem" \
-                --reloadcmd "systemctl restart x-ui" >/dev/null 2>&1 || true
-            if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]]; then
-                "${xui_folder}/x-ui" cert -webCert "${cert_dir}/fullchain.pem" -webCertKey "${cert_dir}/privkey.pem" >/dev/null 2>&1 || true
-                echo_green "  ✔ 证书已申请并配置"
-                return 0
-            else
-                echo_yellow "  ! 证书文件未生成，退回 HTTP 模式。"
-                CHOICE_SSL="4"; return 1
-            fi
-            ;;
-        3)
-            echo_blue "  正在配置自有证书..."
-            "${xui_folder}/x-ui" cert -webCert "${SSL_CERT_PATH}" -webCertKey "${SSL_KEY_PATH}" >/dev/null 2>&1 || true
+                # 安装证书文件（reloadcmd 失败也会返回非零，故用 || true，再校验文件）
+                "$ACME" --installcert --force -d "${ip}" \
+                    --key-file "${cert_dir}/privkey.pem" \
+                    --fullchain-file "${cert_dir}/fullchain.pem" \
+                    --reloadcmd "${reload_cmd}" >/dev/null 2>&1 || true
+                ;;
+        esac
+
+        # 校验证书文件（不依赖退出码）
+        if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]]; then
+            chmod 600 "${cert_dir}/privkey.pem" 2>/dev/null
+            chmod 644 "${cert_dir}/fullchain.pem" 2>/dev/null
+            "$ACME" --upgrade --auto-upgrade >/dev/null 2>&1 || true
+            "${xui_folder}/x-ui" cert -webCert "${cert_dir}/fullchain.pem" -webCertKey "${cert_dir}/privkey.pem" >/dev/null 2>&1 || true
+            echo_green "  ✔ 证书已申请并配置（有效期约 6~90 天，acme.sh 会自动续期）"
+            return 0
+        else
+            echo_yellow "  ! 证书文件未生成，退回 HTTP 模式。"
+            CHOICE_SSL="4"; return 1
+        fi
+    fi
+
+    # 自有证书
+    if [[ "${CHOICE_SSL}" == "3" ]]; then
+        echo_blue "  正在配置自有证书..."
+        if "${xui_folder}/x-ui" cert -webCert "${SSL_CERT_PATH}" -webCertKey "${SSL_KEY_PATH}" >/dev/null 2>&1; then
             echo_green "  ✔ 自有证书已配置"
-            ;;
-        *)
-            echo_yellow "  已跳过 SSL，面板使用 HTTP。"
-            ;;
-    esac
-    return 0
+            return 0
+        else
+            echo_red "  ✘ 自有证书配置失败，退回 HTTP 模式。"
+            CHOICE_SSL="4"; return 1
+        fi
+    fi
+
+    echo_yellow "  已跳过 SSL，面板使用 HTTP。"
+    return 1
 }
 
 # ---------- 写安装结果 ----------
@@ -710,26 +838,132 @@ write_install_result() {
     chmod 600 "${result_file}"
 }
 
+# ---------- 检测 SSH 端口 ----------
+detect_ssh_port() {
+    local port=""
+    # 1) 从 sshd_config 读取（可能被注释）
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        port=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
+    fi
+    # 2) 从 sshd_config.d/*.conf 读取
+    if [[ -z "$port" ]] && [[ -d /etc/ssh/sshd_config.d ]]; then
+        port=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
+    fi
+    # 3) 从实际监听进程反查（最可靠）
+    if [[ -z "$port" ]]; then
+        if command -v ss >/dev/null 2>&1; then
+            port=$(ss -ltnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | head -1 | tr -d ':')
+        fi
+    fi
+    # 4) 兜底默认 22
+    [[ -z "$port" ]] && port="22"
+    echo "$port"
+}
+
+# 检查某端口是否被防火墙放行
+ssh_port_is_allowed() {
+    local port="$1"
+    # ufw
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
+        ufw status 2>/dev/null | grep -qE "(^|[^0-9])${port}(/tcp)?([^0-9]|$)" && return 0
+        return 1
+    fi
+    # firewalld
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+        firewall-cmd --list-ports 2>/dev/null | grep -qE "(^| )${port}/tcp($| )" && return 0
+        firewall-cmd --list-services 2>/dev/null | grep -qE 'ssh' && return 0
+        return 1
+    fi
+    # iptables：无显式 DROP/REJECT 视为放行
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -L INPUT -n 2>/dev/null | grep -qE "dpt:${port}.*(ACCEPT)" && return 0
+    fi
+    # 未检测到有效防火墙 → 视为放行
+    return 0
+}
+
+# 检查是否有任何防火墙处于激活状态
+firewall_active() {
+    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active && return 0
+    command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# ---------- 首屏：显示系统配置并请求确认 ----------
+show_system_info_and_confirm() {
+    echo ""
+    echo_cyan "======================================================"
+    echo_cyan "  安装前系统检测"
+    echo_cyan "======================================================"
+    echo -e "${green}  操作系统  ${plain}: ${PRETTY_NAME:-$release}"
+    echo -e "${green}  内核版本  ${plain}: $(uname -r)"
+    echo -e "${green}  CPU 架构  ${plain}: ${MACHINE_ARCH} ($(uname -m))"
+    echo -e "${green}  公网 IP   ${plain}: ${SERVER_IP}"
+    echo -e "${green}  SSH 端口  ${plain}: ${SSH_PORT}"
+    echo -e "${green}  镜像仓库  ${plain}: https://github.com/${mirror_repo}"
+    echo ""
+
+    # SSH 端口放行检查
+    if firewall_active; then
+        if ssh_port_is_allowed "${SSH_PORT}"; then
+            echo_green "  ✔ 检测到防火墙已放行 SSH 端口 ${SSH_PORT}"
+        else
+            echo ""
+            echo_red   "  ⚠ 警告：检测到 SSH 端口 ${SSH_PORT} 未在防火墙中放行！"
+            echo_red   "     如果你在安装过程中断开连接，可能会被挡在外面无法重连！"
+            echo_yellow "     请先放行 SSH 端口再继续，例如："
+            echo_yellow "       ufw allow ${SSH_PORT}/tcp        （Ubuntu/Debian）"
+            echo_yellow "       firewall-cmd --permanent --add-port=${SSH_PORT}/tcp && firewall-cmd --reload"
+            echo ""
+            local aw
+            read -rp "  仍要继续安装吗？(y 继续 / 其它键退出先去放行): " aw
+            case "$aw" in
+                y|Y|yes|YES) echo_yellow "  已选择继续（请自行注意安全）。" ;;
+                *) echo_yellow "  已退出。请放行 SSH 端口后重新运行。"; exit 0 ;;
+            esac
+        fi
+    else
+        echo_yellow "  ! 未检测到已启用的 ufw / firewalld 防火墙（如为云服务商安全组，请自行确认 ${SSH_PORT} 已放行）"
+    fi
+
+    echo ""
+    echo_cyan "------------------------------------------------------"
+    echo_yellow "  即将开始安装 3x-ui 面板，是否继续？"
+    echo_cyan "------------------------------------------------------"
+    local ans
+    read -rp "  输入 y 开始安装，其它任意键退出: " ans
+    case "$ans" in
+        y|Y|yes|YES)
+            echo_green "  已确认，开始安装..."
+            ;;
+        *)
+            echo_yellow "  已取消，未做任何改动。"
+            exit 0
+            ;;
+    esac
+}
+
 # ---------- 主流程 ----------
 main() {
     print_logo
     check_root
     check_os
 
-    local machine_arch
-    machine_arch=$(arch)
-    if [[ "${machine_arch}" == "unknown" ]]; then
+    MACHINE_ARCH=$(arch)
+    if [[ "${MACHINE_ARCH}" == "unknown" ]]; then
         echo_red "不支持的 CPU 架构：$(uname -m)"
         exit 1
     fi
-    echo_green "CPU 架构：${machine_arch}"
 
-    local server_ip
-    server_ip=$(curl -s --connect-timeout 8 https://api4.ipify.org 2>/dev/null || \
+    SERVER_IP=$(curl -s --connect-timeout 8 https://api4.ipify.org 2>/dev/null || \
                 curl -s --connect-timeout 8 https://ipv4.icanhazip.com 2>/dev/null)
-    server_ip=$(echo "${server_ip}" | tr -d '[:space:]')
-    [[ -z "${server_ip}" ]] && server_ip="<你的服务器IP>"
-    echo_green "公网 IP：${server_ip}"
+    SERVER_IP=$(echo "${SERVER_IP}" | tr -d '[:space:]')
+    [[ -z "${SERVER_IP}" ]] && SERVER_IP="<你的服务器IP>"
+
+    SSH_PORT=$(detect_ssh_port)
+
+    # ★ 首屏：展示系统配置 + 安装确认（未确认不进入下一步）
+    show_system_info_and_confirm
 
     install_base_deps
 
@@ -738,14 +972,13 @@ main() {
     echo_cyan "[2/6] 配置选项"
     ask_database
     ask_ssl
-    ask_confirm
 
     # 版本
     local tag="${XUI_VERSION:-}"
     [[ -z "${tag}" ]] && tag=$(resolve_latest_tag)
     echo_green "将安装版本：${tag}"
 
-    download_and_install "${machine_arch}" "${tag}"
+    download_and_install "${MACHINE_ARCH}" "${tag}"
 
     # 生成随机凭据
     echo ""
@@ -776,7 +1009,7 @@ main() {
 
     # SSL
     local scheme="http"
-    apply_ssl "${config_port}" "${SSL_DOMAIN}" "${server_ip}" && true
+    apply_ssl "${config_port}" "${SSL_DOMAIN}" "${SERVER_IP}" && true
     [[ "${CHOICE_SSL}" != "4" ]] && scheme="https"
 
     # 防火墙：443 始终放行；面板端口按 SSL 选择决定
@@ -804,7 +1037,7 @@ main() {
     echo ""
     echo_cyan "  ---- 账号信息（请立即保存）----"
     echo -e "${green}  访问协议${plain} : ${scheme}"
-    echo -e "${green}  面板地址${plain} : ${cyan}${scheme}://${server_ip}:${config_port}/${config_webpath}${plain}"
+    echo -e "${green}  面板地址${plain} : ${cyan}${scheme}://${SERVER_IP}:${config_port}/${config_webpath}${plain}"
     echo -e "${green}  端口    ${plain} : ${config_port}"
     echo -e "${green}  访问路径${plain} : /${config_webpath}"
     echo -e "${green}  用户名  ${plain} : ${config_username}"
@@ -819,8 +1052,14 @@ main() {
         echo ""
         echo_cyan "  ---- 访问方式：SSH 隧道（已跳过 SSL）----"
         echo_yellow "  由于未配置 SSL，面板未对公网开放端口，请用 SSH 隧道访问："
-        echo -e "${blue}    ssh -L ${config_port}:127.0.0.1:${config_port} root@${server_ip} -p <你的SSH端口>${plain}"
+        echo -e "${blue}    ssh -L ${config_port}:127.0.0.1:${config_port} root@${SERVER_IP} -p ${SSH_PORT}${plain}"
         echo -e "${blue}  然后浏览器打开：${plain}http://127.0.0.1:${config_port}/${config_webpath}"
+        if firewall_active && ! ssh_port_is_allowed "${SSH_PORT}"; then
+            echo ""
+            echo_red "  ⚠ 警告：检测到 SSH 端口 ${SSH_PORT} 未放行，请先放行再断开连接，"
+            echo_red "     否则会把自己拦在外面！"
+            echo_yellow "     放行命令： ufw allow ${SSH_PORT}/tcp"
+        fi
     else
         echo ""
         echo_cyan "  ---- 访问方式：直接用浏览器打开上面的面板地址即可 ----"
