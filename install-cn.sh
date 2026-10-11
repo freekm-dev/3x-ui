@@ -121,6 +121,7 @@ print_logo() {
 LOGO
     echo -e "${plain}"
     echo -e "${green}        FreeKm  3x-ui 中文一键安装脚本${plain}"
+    echo -e "${blue}        官网: https://freekm.com${plain}"
     echo -e "${blue}        镜像仓库: https://github.com/${mirror_repo}${plain}"
     echo -e "${cyan}        ==========================================${plain}"
     echo ""
@@ -1198,6 +1199,7 @@ main() {
     echo -e "${blue}  重启面板     : ${plain}systemctl restart x-ui"
     echo -e "${blue}  查看实时日志 : ${plain}journalctl -u x-ui -f"
     echo ""
+    echo_cyan "  官网    : https://freekm.com"
     echo_cyan "  镜像仓库: https://github.com/${mirror_repo}"
     echo_cyan "======================================================"
 }
