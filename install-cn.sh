@@ -77,7 +77,7 @@ spin_run() {
     if [[ -t 1 ]]; then
         _spin_loop &
         SPIN_PID=$!
-        "$@" >/dev/null 2>&1
+        "$@" </dev/null >/dev/null 2>&1
         local rc=$?
         kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null
         printf "\r\033[K"
@@ -89,11 +89,31 @@ spin_run() {
         return $rc
     else
         # 非交互环境：直接执行，输出常规提示
-        "$@" >/dev/null 2>&1
+        "$@" </dev/null >/dev/null 2>&1
         local rc=$?
         if [[ $rc -eq 0 ]]; then echo -e "${green}  ✔ ${ok_msg}${plain}"; else echo -e "${red}  ✘ ${fail_msg}${plain}"; fi
         return $rc
     fi
+}
+
+# ---------- 统一交互读取（关键：保证"必然会等待用户输入"）----------
+# 问题背景：若直接用 read，当 stdin 被占用时（例如 `curl | bash` 使 stdin 变成
+# 脚本管道；或 apt/dpkg 等子进程消费了 stdin 缓冲），read 会立即返回空值，
+# 导致"用户还没选，脚本就静默使用默认值继续下一步"。
+# 因此统一改为：优先从真实终端 /dev/tty 读取，确保交互输入可靠。
+# 设置环境变量 XUI_ASK_STDIN=1 可强制从标准输入读取（仅用于自动化测试）。
+ask_input() {
+    local __var="$1" __prompt="$2" __val=""
+    if [[ -n "${XUI_ASK_STDIN:-}" ]]; then
+        read -rp "$__prompt" __val || true
+    elif [[ -t 0 ]]; then
+        read -rp "$__prompt" __val || true
+    elif [[ -r /dev/tty ]]; then
+        read -rp "$__prompt" __val < /dev/tty || true
+    else
+        read -rp "$__prompt" __val || true
+    fi
+    printf -v "$__var" '%s' "$__val"
 }
 
 # ---------- 带百分比的下载（真进度）----------
@@ -616,7 +636,7 @@ ask_database() {
     echo -e "${blue}    · 要给很多人用 / 节点多 / 追求稳定   → 选 ${green}2${plain}"
     echo ""
     local choice
-    read -rp "  请输入选项（直接回车默认选 1）: " choice
+    ask_input choice "  请输入选项（直接回车默认选 1）: "
     choice="${choice// /}"
     case "$choice" in
         2) CHOICE_DB="postgres" ;;
@@ -648,14 +668,14 @@ ask_ssl() {
     echo ""
     echo_yellow "  说明：选 1 或 2 会自动放行 80 端口用于证书签发（申请证书前放行）。"
     local choice
-    read -rp "  请输入选项（直接回车默认选 4 跳过）: " choice
+    ask_input choice "  请输入选项（直接回车默认选 4 跳过）: "
     choice="${choice// /}"
     case "$choice" in
         1)
             CHOICE_SSL="1"
             local d
             while :; do
-                read -rp "  请输入你的域名（例如 panel.example.com）: " d
+                ask_input d "  请输入你的域名（例如 panel.example.com）: "
                 d="${d// /}"
                 if [[ "$d" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
                     SSL_DOMAIN="$d"; break
@@ -677,12 +697,12 @@ ask_ssl() {
         3)
             CHOICE_SSL="3"
             while :; do
-                read -rp "  请输入证书文件路径（.crt / .pem）: " SSL_CERT_PATH
+                ask_input SSL_CERT_PATH "  请输入证书文件路径（.crt / .pem）: "
                 [[ -f "$SSL_CERT_PATH" ]] && break
                 echo_yellow "  文件不存在，请重新输入。"
             done
             while :; do
-                read -rp "  请输入私钥文件路径（.key）: " SSL_KEY_PATH
+                ask_input SSL_KEY_PATH "  请输入私钥文件路径（.key）: "
                 [[ -f "$SSL_KEY_PATH" ]] && break
                 echo_yellow "  文件不存在，请重新输入。"
             done
@@ -706,7 +726,7 @@ ask_security_hardening() {
     echo -e "${blue}    · 安装 fail2ban：自动封禁多次登录失败的 IP${plain}"
     echo ""
     local choice
-    read -rp "  是否安装 fail2ban 防暴力破解？[y/N]: " choice
+    ask_input choice "  是否安装 fail2ban 防暴力破解？[y/N]: "
     case "$choice" in
         y|Y|yes|YES)
             case "${release}" in
@@ -1079,7 +1099,7 @@ show_system_info_and_confirm() {
             done
             echo ""
             local aw
-            read -rp "  仍要继续安装吗？(y 继续 / 其它键退出先去放行): " aw
+            ask_input aw "  仍要继续安装吗？(y 继续 / 其它键退出先去放行): "
             case "$aw" in
                 y|Y|yes|YES) echo_yellow "  已选择继续（请自行注意安全）。" ;;
                 *) echo_yellow "  已退出。请放行 SSH 端口后重新运行。"; exit 0 ;;
@@ -1094,7 +1114,7 @@ show_system_info_and_confirm() {
     echo_yellow "  即将开始安装 3x-ui 面板，是否继续？"
     echo_cyan "------------------------------------------------------"
     local ans
-    read -rp "  输入 y 开始安装，其它任意键退出: " ans
+    ask_input ans "  输入 y 开始安装，其它任意键退出: "
     case "$ans" in
         y|Y|yes|YES)
             echo_green "  已确认，开始安装..."
