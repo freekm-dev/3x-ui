@@ -103,17 +103,24 @@ spin_run() {
 # 因此统一改为：优先从真实终端 /dev/tty 读取，确保交互输入可靠。
 # 设置环境变量 XUI_ASK_STDIN=1 可强制从标准输入读取（仅用于自动化测试）。
 ask_input() {
-    local __var="$1" __prompt="$2" __val=""
+    local __var="$1" __prompt="$2" __val="" __rc=0
     if [[ -n "${XUI_ASK_STDIN:-}" ]]; then
-        read -rp "$__prompt" __val || true
+        read -rp "$__prompt" __val || __rc=$?
     elif [[ -t 0 ]]; then
-        read -rp "$__prompt" __val || true
-    elif [[ -r /dev/tty ]]; then
-        read -rp "$__prompt" __val < /dev/tty || true
+        read -rp "$__prompt" __val || __rc=$?
+    # 注意：不能用 [[ -r /dev/tty ]] 判断——设备节点权限上"可读"，但在没有
+    # 控制终端时（如 nohup/setsid/某些面板执行环境）打开会失败，
+    # 而 `read </dev/tty || true` 会把错误吞掉并留下空值，导致脚本静默
+    # 当作空输入继续（"还没选就下一步"）。这里改为真正尝试打开再决定。
+    elif { : < /dev/tty; } 2>/dev/null; then
+        read -rp "$__prompt" __val < /dev/tty || __rc=$?
     else
-        read -rp "$__prompt" __val || true
+        read -rp "$__prompt" __val || __rc=$?
     fi
     printf -v "$__var" '%s' "$__val"
+    # 返回 read 的状态：非 0 = 输入流已结束（EOF）。调用方据此可终止重试循环，
+    # 避免在无输入环境下 while 循环空转刷屏。
+    return ${__rc}
 }
 
 # ---------- 带百分比的下载（真进度）----------
@@ -300,8 +307,22 @@ open_firewall_ports() {
     fi
 
     if [[ $done -eq 0 ]]; then
-        echo_yellow "  ! 未检测到已启用的 ufw / firewalld。"
-        echo_yellow "    如服务商有安全组，请手动放行:${port_list}"
+        echo_yellow "  ! 未检测到已启用的 ufw / firewalld 本机防火墙。"
+        # 有些云主机（如 Oracle Cloud 的部分镜像）不带 ufw/firewalld，
+        # 而是直接用 iptables 规则做过滤——这种情况必须提示用户手动放行。
+        if command -v iptables >/dev/null 2>&1; then
+            local pol
+            pol=$(iptables -S INPUT 2>/dev/null | awk '/^-P INPUT/{print $3}')
+            if [[ "${pol}" == "DROP" || "${pol}" == "REJECT" ]] || \
+               iptables -S INPUT 2>/dev/null | grep -qE -- "-j (DROP|REJECT)"; then
+                echo_red   "  ⚠ 检测到本机用 iptables 规则做过滤（INPUT 策略 ${pol}），需手动放行："
+                for p in "${ports[@]}"; do
+                    [[ -n "$p" ]] && echo_yellow "      iptables -I INPUT -p tcp --dport ${p} -j ACCEPT"
+                done
+                echo_yellow "      保存规则： netfilter-persistent save"
+            fi
+        fi
+        echo_yellow "    同时请确认云控制台「安全组 / 防火墙」已放行:${port_list}"
     else
         echo_green "  ✔ 防火墙已放行:${port_list}"
     fi
@@ -666,16 +687,29 @@ ask_ssl() {
     echo -e "${blue}    · 已有证书文件                        → 选 ${green}3${plain}"
     echo -e "${blue}    · 只想自己用、习惯走 SSH 隧道最安全    → 选 ${green}4${plain}"
     echo ""
-    echo_yellow "  说明：选 1 或 2 会自动放行 80 端口用于证书签发（申请证书前放行）。"
+    echo_yellow "  说明：选 1/2 会自动放行 80 端口用于证书签发（申请证书前放行）。"
+    echo_yellow "        选 1/2/3 会额外放行面板端口（可公网访问）；选 4 不放行面板端口（仅隧道）。"
+    echo_yellow "        请明确输入 1、2、3 或 4（不会替你默认选择）。"
     local choice
-    ask_input choice "  请输入选项（直接回车默认选 4 跳过）: "
-    choice="${choice// /}"
+    # ★ 这里必须由用户明确选择，不能直接回车落到默认值：
+    #   旧版"回车默认选 4"会让只想快点装完的用户在毫不知情的情况下
+    #   进入"面板不对公网开放"的隧道模式，随后就会遇到"装完打不开面板"。
+    while :; do
+        if ! ask_input choice "  请输入选项 [1-4]: "; then
+            echo_red "  未获取到输入（输入流已结束），安装已取消。"
+            exit 1
+        fi
+        choice="${choice// /}"
+        case "$choice" in 1|2|3|4) break ;; *) echo_yellow "  请输入 1、2、3 或 4。" ;; esac
+    done
     case "$choice" in
         1)
             CHOICE_SSL="1"
             local d
             while :; do
-                ask_input d "  请输入你的域名（例如 panel.example.com）: "
+                if ! ask_input d "  请输入你的域名（例如 panel.example.com）: "; then
+                    echo_red "  未获取到输入（输入流已结束），安装已取消。"; exit 1
+                fi
                 d="${d// /}"
                 if [[ "$d" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
                     SSL_DOMAIN="$d"; break
@@ -697,20 +731,24 @@ ask_ssl() {
         3)
             CHOICE_SSL="3"
             while :; do
-                ask_input SSL_CERT_PATH "  请输入证书文件路径（.crt / .pem）: "
+                if ! ask_input SSL_CERT_PATH "  请输入证书文件路径（.crt / .pem）: "; then
+                    echo_red "  未获取到输入（输入流已结束），安装已取消。"; exit 1
+                fi
                 [[ -f "$SSL_CERT_PATH" ]] && break
                 echo_yellow "  文件不存在，请重新输入。"
             done
             while :; do
-                ask_input SSL_KEY_PATH "  请输入私钥文件路径（.key）: "
+                if ! ask_input SSL_KEY_PATH "  请输入私钥文件路径（.key）: "; then
+                    echo_red "  未获取到输入（输入流已结束），安装已取消。"; exit 1
+                fi
                 [[ -f "$SSL_KEY_PATH" ]] && break
                 echo_yellow "  文件不存在，请重新输入。"
             done
             echo_green "  已选择：自有证书"
             ;;
-        *)
+        4)
             CHOICE_SSL="4"
-            echo_green "  已选择：不加证书（HTTP，仅走 SSH 隧道）"
+            echo_green "  已选择：不加证书（HTTP，仅走 SSH 隧道，面板端口不对公网开放）"
             ;;
     esac
 }
@@ -1160,6 +1198,10 @@ main() {
     echo_cyan "[2/6] 配置选项"
     ask_database
     ask_ssl
+    # 记录用户在 SSL 菜单里的【原始】选择：后续防火墙策略以它为准。
+    # 否则"证书申请失败 → 自动退回 HTTP（CHOICE_SSL=4）"会被误判成
+    # "用户主动选择隧道模式"，导致面板端口被关闭、把用户锁在门外。
+    USER_SSL_CHOICE="${CHOICE_SSL}"
 
     # 版本
     local tag="${XUI_VERSION:-}"
@@ -1195,10 +1237,28 @@ main() {
     sleep 1
     systemctl daemon-reload >/dev/null 2>&1
 
-    # SSL
-    local scheme="http"
+    # SSL 证书
     apply_ssl "${config_port}" "${SSL_DOMAIN}" "${SERVER_IP}" && true
-    [[ "${CHOICE_SSL}" != "4" ]] && scheme="https"
+
+    # ★ 顺序修正（重要）：证书是在面板服务【启动之后】才写进配置的，
+    #   必须重启面板才会生效。旧版在这里没有重启，导致：
+    #     · 自有证书(选 3)：证书已写入但面板仍在跑 HTTP；
+    #     · 脚本却把访问地址打印成 https://……
+    #   → 用户照着地址打开就是 SSL 连接失败，表现为"安装成功却无法访问面板"。
+    spin_run "正在应用证书配置（重启面板使其生效）..." "面板服务已重启" "面板服务重启异常" \
+        bash -c "systemctl daemon-reload && systemctl restart x-ui"
+    sleep 1
+
+    # 以「面板实际在跑的协议」为准来确定访问方式，避免地址与实际不符
+    local scheme="http"
+    if [[ "${CHOICE_SSL}" != "4" ]] && \
+       curl -sk -o /dev/null --max-time 6 "https://127.0.0.1:${config_port}/${config_webpath}/" 2>/dev/null; then
+        scheme="https"
+    elif curl -s -o /dev/null --max-time 6 "http://127.0.0.1:${config_port}/${config_webpath}/" 2>/dev/null; then
+        scheme="http"
+    elif [[ "${CHOICE_SSL}" != "4" ]]; then
+        scheme="https"
+    fi
 
     # ============================================================
     # 防火墙策略（仅在用户已确认安装、且面板安装完成后执行）
@@ -1212,12 +1272,22 @@ main() {
     echo ""
     echo_cyan "[防火墙] 根据你的选择配置端口放行..."
 
-    if [[ "${CHOICE_SSL}" == "4" ]]; then
-        # 隧道模式：确保面板端口不对公网开放
+    if [[ "${USER_SSL_CHOICE}" == "4" ]]; then
+        # 用户【主动】选择"不加证书/走隧道"：面板端口不对公网开放
         close_firewall_port "${config_port}"
         open_firewall_ports 443
     else
+        # 用户选择 1/2/3（本意是公网访问）：即使证书失败退回 HTTP，
+        # 也保留面板端口放行，绝不把用户锁在门外。
         open_firewall_ports 443 "${config_port}"
+    fi
+
+    # 证书申请失败退回 HTTP 时给出明确提示（用户本意是要公网访问的）
+    if [[ "${USER_SSL_CHOICE}" != "4" && "${CHOICE_SSL}" == "4" ]]; then
+        echo ""
+        echo_yellow "  ! 你选择了证书方式，但证书未能配置成功，面板已退回 HTTP。"
+        echo_yellow "    为保证你能访问，面板端口仍然对你放行（注意：此时为明文传输）。"
+        echo_yellow "    建议稍后运行 x-ui → SSL 证书管理，重新为面板配置 HTTPS。"
     fi
 
     # 选 1/2 需要 80 端口做证书签发验证（apply_ssl 申请前已放行，这里是幂等兜底）
@@ -1265,6 +1335,25 @@ main() {
     echo ""
     echo_yellow "  ★ 请立即保存以上信息，凭据不会再次显示！"
     echo_yellow "  ★ 凭据保存在：/etc/x-ui/install-result.env"
+
+    # ---- 本机自检：确认面板确实在监听并能响应 ----
+    echo ""
+    echo_cyan "  ---- 自检 ----"
+    if curl -sk -o /dev/null --max-time 6 "${scheme}://127.0.0.1:${config_port}/${config_webpath}/" 2>/dev/null; then
+        echo_green "  ✔ 面板在本机可正常响应（127.0.0.1:${config_port}，协议 ${scheme}）"
+    else
+        echo_red "  ✘ 面板在本机也没有响应，请执行： journalctl -u x-ui -n 50 --no-pager"
+    fi
+
+    # ---- 外网打不开时的排查清单（云安全组是头号原因）----
+    echo ""
+    echo_yellow "  ★ 若用上面的地址在【外网仍打不开】，99% 是云服务商的「安全组 / 防火墙」没放行。"
+    echo_yellow "    请到 VPS 控制台放行以下【入站 TCP】端口："
+    echo -e "${blue}      ${config_port}     ← 面板端口${plain}"
+    if [[ -n "${NEED_PORT_80}" ]]; then
+        echo -e "${blue}      80      ← 证书签发 / 自动续期用${plain}"
+    fi
+    echo -e "${blue}      443     ← 已放行，保留给后续自配服务${plain}"
 
     # 隧道提示：仅当跳过 SSL 时
     if [[ "${CHOICE_SSL}" == "4" ]]; then
