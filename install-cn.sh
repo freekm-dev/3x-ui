@@ -3,9 +3,14 @@
 # ============================================================
 #   3x-ui 中文一键安装脚本 (install-cn.sh)
 #   镜像仓库: https://github.com/freekm-dev/3x-ui
+#   博客: https://freekm.com
 #
-#   基于官方 3x-ui，全程中文交互，资源自托管，
-#   不依赖官方 mhsanaei 仓库。
+#   本项目为第三方汉化版本，基于开源项目 3x-ui
+#   （https://github.com/MHSanaei/3x-ui）修改而来。
+#   版权归原作者所有，本仓库仅提供中文汉化与自托管镜像，
+#   与 3x-ui 原作者无任何隶属关系。
+#
+#   全程中文交互，资源自托管，不依赖官方 mhsanaei 仓库。
 # ============================================================
 
 red='\033[0;31m'
@@ -120,10 +125,11 @@ print_logo() {
 
 LOGO
     echo -e "${plain}"
-    echo -e "${green}        FreeKm  3x-ui 中文一键安装脚本${plain}"
-    echo -e "${blue}        官网: https://freekm.com${plain}"
+    echo -e "${green}        FreeKm 汉化  3x-ui 一键安装脚本${plain}"
+    echo -e "${blue}        博客: https://freekm.com${plain}"
     echo -e "${blue}        镜像仓库: https://github.com/${mirror_repo}${plain}"
     echo -e "${cyan}        ==========================================${plain}"
+    echo -e "${plain}        （第三方汉化，与 3x-ui 原作者无关）"
     echo ""
 }
 
@@ -407,7 +413,7 @@ with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
 NEW_MENU = r"""show_menu() {
     echo -e "
 ╔══════════════════════════════════════════════╗
-│  ${green}3X-UI 面板管理脚本 (FreeKm 中文版)${plain}          │
+│  ${green}3X-UI 面板管理脚本 (FreeKm 汉化)${plain}            │
 │  ${green}0.${plain} 退出脚本                                 │
 │──────────────────────────────────────────────│
 │  ${green}1.${plain} 重置用户名和密码                         │
@@ -1199,7 +1205,7 @@ main() {
     echo -e "${blue}  重启面板     : ${plain}systemctl restart x-ui"
     echo -e "${blue}  查看实时日志 : ${plain}journalctl -u x-ui -f"
     echo ""
-    echo_cyan "  官网    : https://freekm.com"
+    echo_cyan "  博客    : https://freekm.com"
     echo_cyan "  镜像仓库: https://github.com/${mirror_repo}"
     echo_cyan "======================================================"
 }

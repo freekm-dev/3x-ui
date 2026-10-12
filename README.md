@@ -1,12 +1,24 @@
 <div align="center">
 
-# FreeKm 3x-ui 中文版
+```
+   _____ ______ ______ ______ _  __ __  __
+  |  ___| ___ \  ____|  ____| |/ /|  \/  |
+  | |_  | |_/ / |__  | |__  | ' / | \  / |
+  |  _| |    /|  __| |  __| |  <  | |\/| |
+  | |   | |\ \| |____| |____| . \ | |  | |
+  |_|   \_| \_\______|______|_|\_\|_|  |_|
+```
 
-自托管镜像版 3x-ui，**不依赖官方 mhsanaei 仓库**，全程中文一键安装。
+# FreeKm 汉化 · 3x-ui
+
+**第三方汉化版 3x-ui** —— 中文界面 + 自托管镜像，**不依赖官方 mhsanaei 仓库**，全程中文一键安装。
+
+> 本项目由 [freekm.com](https://freekm.com) 汉化整理，**并非 3x-ui 官方项目**，与原作者无任何隶属关系，
+> 版权归 [MHSanaei/3x-ui](https://github.com/MHSanaei/3x-ui) 所有。
 
 [![Version](https://img.shields.io/badge/3x--ui-v3.9.0-2f81f7?style=for-the-badge)](https://github.com/freekm-dev/3x-ui/releases/tag/v3.9.0)
 [![Mirror](https://img.shields.io/badge/mirror-self_hosted-238636?style=for-the-badge)](https://github.com/freekm-dev/3x-ui)
-[![Site](https://img.shields.io/badge/site-freekm.com-8957e5?style=for-the-badge)](https://freekm.com)
+[![Blog](https://img.shields.io/badge/blog-freekm.com-8957e5?style=for-the-badge)](https://freekm.com)
 
 </div>
 
@@ -32,7 +44,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/freekm-dev/3x-ui/master/inst
 | 项目 | 说明 |
 | --- | --- |
 | 面板版本 | 3x-ui **v3.9.0**（最新稳定版） |
-| 安装脚本 | `install-cn.sh`（中文，自研精简版） |
+| 安装脚本 | `install-cn.sh`（中文汉化版） |
 | 官方脚本 | `install.sh`（原版，仅将地址指向本仓库） |
 | 管理菜单 | `x-ui.sh`（安装后可用 `x-ui` 命令调出） |
 | 安装资源 | 自托管于本仓库 Release |
@@ -127,6 +139,13 @@ http://127.0.0.1:<面板端口>/<你的访问路径>
 > 若同时想用面板管理 Xray 节点流量，把隧道端口设成你节点的入站端口即可。
 > 安装脚本在检测到 SSH 服务时，会在结尾**自动生成对应的隧道命令**，直接复制即可。
 
-## 项目主页
+## 免责声明
+
+- 本项目是 **第三方汉化与自托管镜像**，不是 3x-ui 的官方发行版，与原作者无隶属或合作关系。
+- 3x-ui 的著作权归原作者 [MHSanaei](https://github.com/MHSanaei/3x-ui) 及贡献者所有，遵循其原始开源许可。
+- 本仓库仅做中文界面汉化、安装流程优化，并把安装资源镜像到自有 Release 以便稳定获取。
+- 本项目不提供任何形式的担保，使用者需自行承担使用风险，并遵守所在地区的法律法规。
+
+## 博客
 
 https://freekm.com
