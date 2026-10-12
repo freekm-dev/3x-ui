@@ -39,7 +39,7 @@ CHOICE_SSL="4"
 SSL_DOMAIN=""
 SSL_CERT_PATH=""
 SSL_KEY_PATH=""
-NEED_PORT_80=""   # 选 1/2 时置 1，安装完成后统一放行 80
+NEED_PORT_80=""   # 选 1/2 时置 1（80 已在证书申请前放行，安装末尾仅作幂等兜底）
 
 # 运行环境信息（全局）
 MACHINE_ARCH=""
@@ -646,7 +646,7 @@ ask_ssl() {
     echo -e "${blue}    · 已有证书文件                        → 选 ${green}3${plain}"
     echo -e "${blue}    · 只想自己用、习惯走 SSH 隧道最安全    → 选 ${green}4${plain}"
     echo ""
-    echo_yellow "  说明：选 1 或 2 会在安装完成时自动为你放行 80 端口用于证书签发。"
+    echo_yellow "  说明：选 1 或 2 会自动放行 80 端口用于证书签发（申请证书前放行）。"
     local choice
     read -rp "  请输入选项（直接回车默认选 4 跳过）: " choice
     choice="${choice// /}"
@@ -663,16 +663,16 @@ ask_ssl() {
                 echo_yellow "  域名格式不正确，请重新输入。"
             done
             echo_green "  已选择：域名证书（${SSL_DOMAIN}）"
-            # 80 端口放行延后到安装完成时统一处理（见 main 中防火墙节点）
+            # 80 端口会在申请证书前自动放行（见 apply_ssl → ensure_cert_ports_ready）
             NEED_PORT_80="1"
-            echo_blue "  域名证书需要 80 端口做验证，将在安装完成时自动放行 80 端口。"
+            echo_blue "  域名证书需要 80 端口做验证，稍后会自动放行 80 端口。"
             ;;
         2)
             CHOICE_SSL="2"
             echo_green "  已选择：IP 证书"
-            # 80 端口放行延后到安装完成时统一处理
+            # 80 端口会在申请证书前自动放行（见 apply_ssl → ensure_cert_ports_ready）
             NEED_PORT_80="1"
-            echo_blue "  IP 证书需要 80 端口做验证，将在安装完成时自动放行 80 端口。"
+            echo_blue "  IP 证书需要 80 端口做验证，稍后会自动放行 80 端口。"
             ;;
         3)
             CHOICE_SSL="3"
@@ -778,19 +778,28 @@ apply_ssl() {
         mkdir -p "${cert_dir}"
         local reload_cmd="systemctl restart x-ui"
 
+        # ★ 关键顺序：必须先放行 80，再申请证书。
+        #   HTTP-01 验证依赖 Let's Encrypt 从公网回连本机 80 端口，
+        #   若把 80 放行留到安装末尾统一执行，证书必然超时失败。
+        ensure_cert_ports_ready
+
         case "${CHOICE_SSL}" in
             1)
                 # ---- 域名证书 ----
                 local target="${domain}"
-                echo_blue "  正在申请域名证书：${target}（需要 80 端口可达）..."
+                echo_blue "  正在申请域名证书：${target}（HTTP-01 验证，80 端口）..."
                 "$ACME" --set-default-ca --server letsencrypt --force >/dev/null 2>&1 || true
                 local err_log="/tmp/acme-domain.log"
                 if ! "$ACME" --issue -d "${target}" --standalone --httpport 80 --force >"${err_log}" 2>&1; then
-                    echo_red "  ✘ 域名证书签发失败。"
-                    echo_yellow "    可能原因：80 端口不通 / 域名未解析到本机 / 防火墙拦截"
-                    echo_yellow "    详细日志：${err_log}"
-                    tail -n 3 "${err_log}" 2>/dev/null | sed 's/^/      /'
-                    CHOICE_SSL="4"; return 1
+                    # 回退：HTTP-01 走不通时改用 TLS-ALPN-01（走 443，本机 443 通常空闲且已放行）
+                    echo_yellow "  ! HTTP-01（80 端口）验证失败，改试 TLS-ALPN-01（443 端口）..."
+                    if ! "$ACME" --issue -d "${target}" --alpn --tlsport 443 --force >>"${err_log}" 2>&1; then
+                        echo_red "  ✘ 域名证书签发失败。"
+                        echo_yellow "    详细日志：${err_log}"
+                        tail -n 5 "${err_log}" 2>/dev/null | sed 's/^/      /'
+                        print_cert_fail_hint
+                        CHOICE_SSL="4"; return 1
+                    fi
                 fi
                 "$ACME" --installcert --force -d "${target}" \
                     --key-file "${cert_dir}/privkey.pem" \
@@ -799,19 +808,26 @@ apply_ssl() {
                 ;;
             2)
                 # ---- IP 证书（shortlived profile，约 6 天有效，自动续期）----
-                echo_blue "  正在申请 IP 证书：${ip}（需要 80 端口可达，约 6 天有效）..."
+                echo_blue "  正在申请 IP 证书：${ip}（HTTP-01 验证，80 端口，约 6 天有效）..."
                 "$ACME" --set-default-ca --server letsencrypt --force >/dev/null 2>&1 || true
                 local err_log="/tmp/acme-ip.log"
                 if ! "$ACME" --issue -d "${ip}" --standalone \
                         --server letsencrypt \
                         --certificate-profile shortlived \
                         --days 6 --httpport 80 --force >"${err_log}" 2>&1; then
-                    echo_red "  ✘ IP 证书签发失败。"
-                    echo_yellow "    可能原因：80 端口不通 / 安全组未放行 / Let's Encrypt 短证书限流"
-                    echo_yellow "    详细日志：${err_log}"
-                    tail -n 3 "${err_log}" 2>/dev/null | sed 's/^/      /'
-                    rm -rf ~/.acme.sh/${ip} ~/.acme.sh/${ip}_ecc 2>/dev/null
-                    CHOICE_SSL="4"; return 1
+                    # 回退：HTTP-01 走不通时改用 TLS-ALPN-01（走 443，本机 443 通常空闲且已放行）
+                    echo_yellow "  ! HTTP-01（80 端口）验证失败，改试 TLS-ALPN-01（443 端口）..."
+                    if ! "$ACME" --issue -d "${ip}" --alpn --tlsport 443 \
+                            --server letsencrypt \
+                            --certificate-profile shortlived \
+                            --days 6 --force >>"${err_log}" 2>&1; then
+                        echo_red "  ✘ IP 证书签发失败。"
+                        echo_yellow "    详细日志：${err_log}"
+                        tail -n 5 "${err_log}" 2>/dev/null | sed 's/^/      /'
+                        print_cert_fail_hint
+                        rm -rf ~/.acme.sh/${ip} ~/.acme.sh/${ip}_ecc 2>/dev/null
+                        CHOICE_SSL="4"; return 1
+                    fi
                 fi
                 # 安装证书文件（reloadcmd 失败也会返回非零，故用 || true，再校验文件）
                 "$ACME" --installcert --force -d "${ip}" \
@@ -931,8 +947,8 @@ detect_all_ssh_ports() {
     echo "$ports" | tr '\n' ' ' | sed 's/ *$//'
 }
 
-# 检查某端口是否被防火墙放行
-ssh_port_is_allowed() {
+# 检查某端口是否被防火墙放行（通用）
+port_is_allowed() {
     local port="$1"
     # ufw
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
@@ -942,15 +958,70 @@ ssh_port_is_allowed() {
     # firewalld
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
         firewall-cmd --list-ports 2>/dev/null | grep -qE "(^| )${port}/tcp($| )" && return 0
-        firewall-cmd --list-services 2>/dev/null | grep -qE 'ssh' && return 0
+        # firewalld 也常以「服务」形式放行，ssh 服务对应 22 端口
+        if [[ "${port}" == "22" ]] && firewall-cmd --list-services 2>/dev/null | grep -qw 'ssh'; then
+            return 0
+        fi
         return 1
     fi
-    # iptables：无显式 DROP/REJECT 视为放行
+    # iptables：有显式 ACCEPT 视为放行
     if command -v iptables >/dev/null 2>&1; then
         iptables -L INPUT -n 2>/dev/null | grep -qE "dpt:${port}.*(ACCEPT)" && return 0
     fi
     # 未检测到有效防火墙 → 视为放行
     return 0
+}
+
+# 兼容旧名（语义与 port_is_allowed 相同）
+ssh_port_is_allowed() {
+    port_is_allowed "$1"
+}
+
+# ---------- 证书签发前置：确保 80（及 443 回退口）可从公网访问 ----------
+# HTTP-01 验证由 Let's Encrypt 从公网【主动回连】本机 80 端口，
+# 因此必须在申请证书【之前】放行 80，否则必然出现
+# "Timeout during connect (likely firewall problem)"。
+ensure_cert_ports_ready() {
+    echo ""
+    echo_blue "  证书签发需要 80 端口可从公网访问（Let's Encrypt 会主动回连验证）"
+
+    if firewall_active; then
+        local need_open=0
+        port_is_allowed 80 || need_open=1
+        port_is_allowed 443 || need_open=1
+        if [[ ${need_open} -eq 1 ]]; then
+            echo_blue "  正在放行 80 / 443 端口..."
+            open_firewall_ports 80 443
+            sleep 1
+        fi
+        if port_is_allowed 80; then
+            echo_green "  ✔ 已放行 80/tcp（证书验证用）"
+        else
+            echo_yellow "  ! 80/tcp 放行似乎未生效，证书可能仍会失败"
+        fi
+    else
+        echo_yellow "  ! 未检测到本机防火墙（ufw / firewalld）"
+        echo_yellow "    若你的服务器在云平台（Vultr / AWS / 阿里云 / 腾讯云 等），"
+        echo_yellow "    请到控制台的「安全组 / 防火墙」中确认已放行 80 端口，否则证书必然失败。"
+    fi
+
+    # 80 端口占用检查（acme.sh standalone 模式需临时独占 80）
+    if ss -ltn 2>/dev/null | grep -qE ':80[[:space:]]' \
+       || ss -ltn 2>/dev/null | grep -qE ':80$' \
+       || netstat -ltn 2>/dev/null | grep -qE ':80[[:space:]]'; then
+        echo_yellow "  ! 检测到 80 端口已被其它程序占用（可能是 nginx / apache / 其它服务）"
+        echo_yellow "    证书签发需临时独占 80，若签发失败请先停掉占用 80 的服务再重试。"
+    fi
+    echo ""
+}
+
+# 证书签发失败时的排查指引
+print_cert_fail_hint() {
+    echo_yellow "    排查建议（按可能性排序）："
+    echo_yellow "      1) 云平台安全组：到 VPS 控制台确认已放行 80 端口（最常见原因）"
+    echo_yellow "      2) 本机防火墙：ufw allow 80/tcp  （或 firewall-cmd --permanent --add-port=80/tcp --reload）"
+    echo_yellow "      3) 端口被占用：ss -ltnp | grep ':80 '  看是否是 nginx/apache 占用"
+    echo_yellow "      4) 外网自测：用手机流量或其他电脑访问 http://<你的IP>/ 能否打开"
 }
 
 # 检查是否有任何防火墙处于激活状态
@@ -1114,7 +1185,7 @@ main() {
     #   · 443          → 永远放行（保留给用户后续自配服务使用，面板本身不用 443）
     #   · 选 1/2/3     → 额外放行面板端口（对公网开放）
     #   · 选 4（隧道） → 不放行面板端口，但 443 仍保持放行
-    #   · 选 1/2       → 额外放行 80 端口（证书签发验证用）
+    #   · 选 1/2       → 额外放行 80 端口（已在证书申请前放行，此处为幂等兜底）
     # 注：用户若在“输入 y 开始安装”处选择退出，则不会执行到此处，
     #     防火墙不会有任何改动。
     # ============================================================
@@ -1129,7 +1200,7 @@ main() {
         open_firewall_ports 443 "${config_port}"
     fi
 
-    # 选 1/2 需要 80 端口做证书签发验证
+    # 选 1/2 需要 80 端口做证书签发验证（apply_ssl 申请前已放行，这里是幂等兜底）
     if [[ -n "${NEED_PORT_80}" ]]; then
         open_firewall_ports 80
     fi
@@ -1149,7 +1220,7 @@ main() {
         fi
     fi
 
-    write_install_result "${config_username}" "${config_password}" "${config_port}" "${config_webpath}" "${scheme}" "${server_ip}"
+    write_install_result "${config_username}" "${config_password}" "${config_port}" "${config_webpath}" "${scheme}" "${SERVER_IP}"
 
     ask_security_hardening
 
